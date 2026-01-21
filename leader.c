@@ -6,6 +6,9 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <netinet/in.h>
+#include <string.h>
+#include <errno.h>
+
 
 
 //MACROS
@@ -15,6 +18,7 @@
 
 //FUNC PROTOTYPES
 void* accept_handler(void* arg); 
+void driveForward(); 
 
 //SOCKET
 int32_t leader_socket_fd;

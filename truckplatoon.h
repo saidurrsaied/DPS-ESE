@@ -1,4 +1,4 @@
-//truckplatoon.h
+//file: truckplatoon.h
 
 #ifndef TRUCKPLATOON_H
 #define TRUCKPLATOON_H
@@ -6,7 +6,10 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <stdint.h>
+#include <unistd.h>
 #include <time.h>
+#include <stdio.h>
+
 
 //SOCKET
 #define LEADER_IP "127.0.0.1"
@@ -15,7 +18,7 @@
 
 #define CONNECTION_TIMEOUT_MS 500
 #define MESSAGE_TIMEOUT_MS 200
-#define LEADER_SLEEP 100000 //us
+#define LEADER_SLEEP 2 //sec
 
 typedef enum {
     EAST,       // +x axis
@@ -34,7 +37,7 @@ typedef enum {
 
 //struct to define truck state
 
-typedef __attribute__ ((packed))struct {
+typedef struct __attribute__ ((packed)) {
     int32_t positionX ; 
     int32_t positionY; 
     int32_t currentSpeed; 
@@ -45,7 +48,7 @@ typedef __attribute__ ((packed))struct {
 
 
 //Struct used for leader messages 
-typedef __attribute__((packed)) struct {
+typedef struct __attribute__((packed))  {
     truck leaderState; 
     uint64_t cmd_timestamp; 
     uint64_t command_id;

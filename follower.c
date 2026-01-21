@@ -8,6 +8,8 @@
 #include <unistd.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <string.h>
+#include <errno.h>
 
 #define MAX_CMD 10
 
