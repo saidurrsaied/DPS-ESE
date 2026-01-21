@@ -1,16 +1,24 @@
 //leader.c
 
+//TODO: 
+/*
+    1. Add follower intruder notification receive capability and handle logic 
+           **Details: If the follower send an intruder warning to the leader, the leader shall cruise at the speed of the 
+            intruder (sent by follower in the intruder notification ). The leader shall exit upon intruder timeout/ clear event. 
+*/
+
 #define _POSIX_C_SOURCE 200809L
-#include "truckplatoon.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 #include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <time.h>
+
+#include "truckplatoon.h"
 
 int leader_socket_fd;
 int follower_fd_list[MAX_FOLLOWERS];
@@ -109,15 +117,15 @@ void* accept_handler(void* arg) {
 
         // Send rear-truck info to the newly connected follower. 
         //The first follower has no rear truck.but it expects a message
-        LeaderMessage initialMsg = {0};
-        initialMsg.type = MSG_UPDATE_REAR;
+        LD_MESSAGE initialMsg = {0};
+        initialMsg.type = MSG_LDR_UPDATE_REAR;
         initialMsg.payload.rearInfo.has_rearTruck = 0; // First connection has no rear
         send(follower_fd, &initialMsg, sizeof(initialMsg), 0);
 
         // If there is a previous follower, update it so its rear points to this new follower 
         if (id > 0) {
-            LeaderMessage update_rearInfo = {0};
-            update_rearInfo.type = MSG_UPDATE_REAR;
+            LD_MESSAGE update_rearInfo = {0};
+            update_rearInfo.type = MSG_LDR_UPDATE_REAR;
             update_rearInfo.payload.rearInfo.rearTruck_Address = reg_msg.selfAddress;
             update_rearInfo.payload.rearInfo.has_rearTruck = 1; 
             send(follower_fd_list[id-1], &update_rearInfo, sizeof(update_rearInfo), 0);
@@ -208,8 +216,8 @@ void* send_handler(void* arg) {
         LeaderCommand ldr_cmd = cmd_queue.queue[cmd_queue.head];
         cmd_queue.head = (cmd_queue.head + 1) % CMD_QUEUE_SIZE;
 
-        LeaderMessage ldr_cmd_msg;
-        ldr_cmd_msg.type = MSG_CMD;
+        LD_MESSAGE ldr_cmd_msg;
+        ldr_cmd_msg.type = MSG_LDR_CMD;
         ldr_cmd_msg.payload.cmd = ldr_cmd;
 
         pthread_mutex_unlock(&cmd_queue.mutex);

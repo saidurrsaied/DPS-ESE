@@ -26,20 +26,33 @@ typedef enum {
 
 /* Message Types */
 typedef enum {
-    MSG_CMD,
-    MSG_UPDATE_REAR
-} MsgType;
+    MSG_LDR_CMD,
+    MSG_LDR_UPDATE_REAR, 
+    MSG_LDR_EMERGENCY_BRAKE
+} Leader_Truck_MSG_Type;
 
 typedef enum {
-    CRUISE = 0,
+    MSG_FT_POSITION, 
+    MSG_FT_EMERGENCY_BRAKE, 
+    MSG_FT_INTRUDER_REPORT
+}Follower_Truck_MSG_Type;
+
+typedef enum {
+    LEADER, 
+    FOLLOWER, 
+} MSG_SENDER; 
+
+typedef enum {
+    CRUISE,
     ACCELERATE,
     DECELERATE,
     TURNING,
     EMERGENCY_BRAKE,
-    STOPPED
+    STOPPED, 
+    INTRUDER_FOLLOW
 } TRUCK_CONTROL_STATE;
 
-/* Truck state */
+/* Truck struct */
 typedef struct {
     int32_t x;
     int32_t y;
@@ -67,27 +80,56 @@ typedef struct {
 
 /* Topology message */
 typedef struct {
-    int has_rearTruck;
+    int32_t has_rearTruck;
     NetInfo rearTruck_Address;
 } RearInfoMsg;
 
 
+typedef struct {
+    int32_t speed;          // intruder speed
+    int32_t length;         // intruder length required ro claculate safe distance 
+    uint32_t duration_ms;   // expected intrusion duration
+} IntruderInfo;
 
 typedef struct {
     LeaderCommand queue[CMD_QUEUE_SIZE];
-    int head;
-    int tail;
+    int32_t head;
+    int32_t tail;
     pthread_mutex_t mutex;
     pthread_cond_t not_empty;
 } CommandQueue;
 
 typedef struct {
-    MsgType type; 
+    Leader_Truck_MSG_Type type; 
     union {
         LeaderCommand cmd; 
         RearInfoMsg rearInfo; 
     } payload;       
-}LeaderMessage;
+}LD_MESSAGE;
+
+/* Front Truck UDP Message Typedefs */
+typedef struct {
+    int32_t x; 
+    int32_t y; 
+}FT_POSITION; 
+
+typedef struct {
+    uint8_t emergency_Flag; 
+    uint8_t resendFlag; 
+}FT_EMERGENCY; 
+
+typedef struct {
+    Follower_Truck_MSG_Type type; 
+    union{
+        FT_POSITION position; 
+        FT_EMERGENCY warning; 
+        IntruderInfo intruder; 
+    }payload; 
+}FT_MESSAGE; 
+
+
+
+
 
 
 
