@@ -19,7 +19,7 @@ typedef enum {
     EVT_DISTANCE   = 2, 
     EVT_CRUISE_CMD = 3,
     EVT_INTRUDER_CLEAR = 4, 
-    EVT_EMERGENCY_TIMER      = 5
+    EVT_EMERGENCY_TIMER = 5
 } EventType;
 
 

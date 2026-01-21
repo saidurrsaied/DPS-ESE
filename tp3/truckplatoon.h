@@ -127,10 +127,4 @@ typedef struct {
     }payload; 
 }FT_MESSAGE; 
 
-
-
-
-
-
-
 #endif

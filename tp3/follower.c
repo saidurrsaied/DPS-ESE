@@ -107,14 +107,14 @@ void* udp_listener(void* arg) {
 
     switch (msg.type) {
         case MSG_FT_EMERGENCY_BRAKE:
-            Event e = {.type = EVT_EMERGENCY};
-            push_event(&truck_EventQ, &e);
+            Event emergency_evt = {.type = EVT_EMERGENCY};
+            push_event(&truck_EventQ, &emergency_evt);
             break;
 
         case MSG_FT_POSITION:
-            Event e = {.type = EVT_DISTANCE};
-            e.event_data.ft_pos = msg.payload.position;
-            push_event(&truck_EventQ, &e);
+            Event distance_evt = {.type = EVT_DISTANCE};
+            distance_evt.event_data.ft_pos = msg.payload.position;
+            push_event(&truck_EventQ, &distance_evt);
             break;
     }
 }
@@ -130,8 +130,8 @@ void* tcp_listener(void* arg) {
 
             switch (msg.type){
                 case MSG_LDR_CMD:
-                    Event e = {.type = EVT_CRUISE_CMD, .event_data.leader_cmd = msg.payload.cmd};
-                    push_event(&truck_EventQ, &e);
+                    Event cmd_evt = {.type = EVT_CRUISE_CMD, .event_data.leader_cmd = msg.payload.cmd};
+                    push_event(&truck_EventQ, &cmd_evt);
                     break;
                 case MSG_LDR_UPDATE_REAR: 
                     has_rearTruck = msg.payload.rearInfo.has_rearTruck;
@@ -140,8 +140,8 @@ void* tcp_listener(void* arg) {
                     break; 
 
                 case MSG_LDR_EMERGENCY_BRAKE: 
-                    Event e = {.type = EVT_EMERGENCY};
-                    push_event(&truck_EventQ, &e);
+                    Event emergency_evt = {.type = EVT_EMERGENCY};
+                    push_event(&truck_EventQ, &emergency_evt);
             
                 default:
                     break;
