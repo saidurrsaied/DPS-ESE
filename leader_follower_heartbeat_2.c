@@ -1,270 +1,579 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
-#include <time.h>
 #include <pthread.h>
-#include <unistd.h>     /* for sleep/usleep on POSIX systems */
-#include <arpa/inet.h>   /* for inet_pton, htons */
+#include <unistd.h>
+#include <time.h>
+
+#include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <fcntl.h>
+#include <sys/time.h>
 
+#include "truckplatoon.h"
 
-#define HEARTBEAT_INTERVAL_MS   100    /* Leader sends every 100 ms */
-#define RECONNECT_DELAY_MS      500    /* Wait 500 ms before retry after failure */
-#define MAX_RECONNECT_ATTEMPTS  10     /* Give up after 10 consecutive failures */
-#define HEARTBEAT_TIMEOUT_MS    200    /* Follower declares leader dead after 200 ms */
+#define main leader_main
+#include "leader.c"
+#undef main
 
-/* Port number on which the follower listens for heartbeat messages. */
-#define FOLLOWER_LISTEN_PORT     6000
+/* ------------------- SETTINGS ------------------- */
+#define HEARTBEAT_INTERVAL_MS   100
+#define RECONNECT_DELAY_MS      500
+#define MAX_RECONNECT_ATTEMPTS  10
 
+#define HEARTBEAT_TIMEOUT_MS    2000
+#define FOLLOWER_DEFAULT_LISTEN_PORT 6000
 
-static const char *follower_addresses[] = {
-    "127.0.0.1", "127.0.0.2", "127.0.0.3", "127.0.0.4","127.0.0.5"   /* loopback follower */
-    /* Additional follower IP strings can be added here */
-};
-/* Count how many follower addresses are in the array. */
-static const size_t num_followers = sizeof(follower_addresses) / sizeof(follower_addresses[0]);
-
-
+/* ------------------- SHARED STATE ------------------- */
 static int is_leader_active = 0;
-
 static struct timespec last_heartbeat_time;
-
 static pthread_mutex_t heartbeat_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+static uint16_t follower_listen_port = FOLLOWER_DEFAULT_LISTEN_PORT;
+static int leader_tcp_fd = -1;
+static char follower_leader_ip[64];
+static char follower_self_ip[64];
+static uint16_t follower_leader_port = LEADER_PORT;
 
-static void sleep_for_milliseconds(unsigned int ms)
+typedef enum {
+    MODE_LEADER,
+    MODE_FOLLOWER,
+    MODE_BOTH
+} RunMode;
+
+static pthread_mutex_t leader_ready_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t leader_ready_cond = PTHREAD_COND_INITIALIZER;
+static int leader_ready = 0;
+
+/* ------------------- HELPERS ------------------- */
+static void sleep_for_milliseconds(int ms)
 {
     struct timespec ts;
-    ts.tv_sec = ms / 1000;
-    ts.tv_nsec = (ms % 1000) * 1000000UL;
+    ts.tv_sec  = ms / 1000;
+    ts.tv_nsec = (ms % 1000) * 1000000L;
+
     while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {
-        /* If interrupted by a signal, nanosleep returns -1 and
-         * updates ts with the remaining time.  Loop until it
-         * completes successfully. */
+        // retry
     }
 }
 
-/*
- * Leader heartbeat thread.
- */
+static double ms_since(struct timespec now, struct timespec then)
+{
+    double sec  = (double)(now.tv_sec - then.tv_sec) * 1000.0;
+    double nsec = (double)(now.tv_nsec - then.tv_nsec) / 1000000.0;
+    return sec + nsec;
+}
+
+static void signal_leader_ready(int status)
+{
+    pthread_mutex_lock(&leader_ready_mutex);
+    leader_ready = status;
+    pthread_cond_broadcast(&leader_ready_cond);
+    pthread_mutex_unlock(&leader_ready_mutex);
+}
+
+static int wait_for_leader_ready(void)
+{
+    pthread_mutex_lock(&leader_ready_mutex);
+    while (leader_ready == 0) {
+        pthread_cond_wait(&leader_ready_cond, &leader_ready_mutex);
+    }
+    int status = leader_ready;
+    pthread_mutex_unlock(&leader_ready_mutex);
+    return status;
+}
+
+static int parse_port(const char *s, uint16_t *out)
+{
+    char *end = NULL;
+    long val = strtol(s, &end, 10);
+    if (s == end || *end != '\0' || val <= 0 || val > 65535) {
+        return -1;
+    }
+    *out = (uint16_t)val;
+    return 0;
+}
+
+static void print_usage(const char *prog)
+{
+    printf("Usage: %s [--leader|--follower|--both] [options]\n", prog);
+    printf("Options:\n");
+    printf("  --leader             Leader + heartbeat sender (default: both)\n");
+    printf("  --follower           Follower heartbeat monitor only\n");
+    printf("  --both               Run leader + one follower monitor in one process\n");
+    printf("  --listen-port <port> UDP port for follower heartbeat monitor (default %d)\n",
+           FOLLOWER_DEFAULT_LISTEN_PORT);
+    printf("  --leader-ip <ip>      Leader IP for follower registration (default %s)\n",
+           LEADER_IP);
+    printf("  --leader-port <port>  Leader TCP port for registration (default %d)\n",
+           LEADER_PORT);
+    printf("  --self-ip <ip>        Self IP for registration (default %s)\n",
+           LEADER_IP);
+    printf("  --help                Show this help\n");
+}
+
+static int connect_to_leader(const char *leader_ip, uint16_t leader_port)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        perror("follower: socket");
+        return -1;
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(leader_port);
+
+    if (inet_pton(AF_INET, leader_ip, &addr.sin_addr) <= 0) {
+        fprintf(stderr, "follower: invalid leader IP: %s\n", leader_ip);
+        close(fd);
+        return -1;
+    }
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("follower: connect");
+        close(fd);
+        return -1;
+    }
+
+    return fd;
+}
+
+static int register_with_leader(int fd, const char *self_ip, uint16_t self_port)
+{
+    FollowerRegisterMsg reg;
+    memset(&reg, 0, sizeof(reg));
+    strncpy(reg.selfAddress.ip, self_ip, sizeof(reg.selfAddress.ip) - 1);
+    reg.selfAddress.udp_port = self_port;
+
+    ssize_t sent = send(fd, &reg, sizeof(reg), 0);
+    if (sent < 0) {
+        perror("follower: register");
+        return -1;
+    }
+
+    printf("[FOLLOWER] registered with leader as %s:%d\n", self_ip, self_port);
+    return 0;
+}
+
+static int follower_reconnect(void)
+{
+    int fd = connect_to_leader(follower_leader_ip, follower_leader_port);
+    if (fd < 0) {
+        return -1;
+    }
+
+    if (register_with_leader(fd, follower_self_ip, follower_listen_port) != 0) {
+        close(fd);
+        return -1;
+    }
+
+    if (leader_tcp_fd >= 0) {
+        close(leader_tcp_fd);
+    }
+    leader_tcp_fd = fd;
+    return 0;
+}
+
+static int snapshot_followers(NetInfo *out, int max)
+{
+    int count = 0;
+    pthread_mutex_lock(&mutex_client_fd_list);
+    count = follower_count;
+    if (count > max) {
+        count = max;
+    }
+    for (int i = 0; i < count; i++) {
+        out[i] = follower_Addresses[i];
+    }
+    pthread_mutex_unlock(&mutex_client_fd_list);
+    return count;
+}
+
+/* ------------------- LEADER RUNTIME (FROM leader.c) ------------------- */
+static void *leaderRuntimeThread(void *arg)
+{
+    (void)arg;
+
+    srand(time(NULL));
+    pthread_mutex_init(&mutex_client_fd_list, NULL);
+
+    leader = (Truck){0,0,1,NORTH,CRUISE};
+
+    leader_socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (leader_socket_fd < 0) {
+        perror("leader: socket");
+        signal_leader_ready(-1);
+        return NULL;
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(LEADER_PORT);
+    addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(leader_socket_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("leader: bind");
+        signal_leader_ready(-1);
+        return NULL;
+    }
+    if (listen(leader_socket_fd, MAX_FOLLOWERS) < 0) {
+        perror("leader: listen");
+        signal_leader_ready(-1);
+        return NULL;
+    }
+
+    cmd_queue.head = 0;
+    cmd_queue.tail = 0;
+    pthread_mutex_init(&cmd_queue.mutex, NULL);
+    pthread_cond_init(&cmd_queue.not_empty, NULL);
+
+    if (pthread_create(&acceptor_tid, NULL, accept_handler, NULL) != 0) {
+        perror("pthread_create acceptor");
+        signal_leader_ready(-1);
+        return NULL;
+    }
+    if (pthread_create(&sender_tid, NULL, send_handler, NULL) != 0) {
+        perror("pthread_create sender");
+        signal_leader_ready(-1);
+        return NULL;
+    }
+
+    printf("Leader started\n");
+    signal_leader_ready(1);
+
+    while (1) {
+        leader_decide_next_state(&leader);
+        move_truck(&leader);
+
+        LeaderCommand ldr_cmd = {
+            .command_id = cmd_id++,
+            .leader = leader
+        };
+
+        queue_commands(&ldr_cmd);
+
+        printf("Leader pos (%d,%d), sent command: %lu \n", leader.x, leader.y, cmd_id);
+        fflush(stdout);
+
+        sleep(LEADER_SLEEP);
+    }
+
+    return NULL;
+}
+
+/* ------------------- THREAD 1: LEADER SENDS HEARTBEAT ------------------- */
 static void *leaderHeartbeatThread(void *arg)
 {
     (void)arg;
-    /* Define the heartbeat message and its length.  We send this
-     * text to followers so they know the leader is alive. */
-    const char heartbeat_message[] = "Leader Active";
-    const size_t message_length = strlen(heartbeat_message);
 
-    /* Track how many consecutive reconnection attempts have been made.
-     * When this exceeds MAX_RECONNECT_ATTEMPTS the thread stops. */
-    int reconnect_attempts = 0;
-    /* Flag indicating whether we should continue running the loop. */
-    int running = 1;
-
-    /* Create the UDP socket for sending.  Using AF_INET and
-     * SOCK_DGRAM selects an IPv4 UDP socket【804940706067835†L34-L87】. */
-    int socket_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (socket_fd < 0) {
+    const char *heartbeat_msg = "Leader Active";
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
         perror("leader: socket");
         return NULL;
     }
 
+    int reconnect_attempts = 0;
+    int running = 1;
+    int waiting_logged = 0;
+
     while (running) {
-        if (socket_fd >= 0) {
-            /* For each follower in our list, build the destination
-             * address structure and send the heartbeat. */
-            for (size_t i = 0; i < num_followers; i++) {
-                struct sockaddr_in dest_addr;
-                memset(&dest_addr, 0, sizeof(dest_addr));
-                dest_addr.sin_family = AF_INET;
-                dest_addr.sin_port = htons(FOLLOWER_LISTEN_PORT);
-                if (inet_pton(AF_INET, follower_addresses[i], &dest_addr.sin_addr) <= 0) {
-                    fprintf(stderr, "leader: invalid follower IP %s\n", follower_addresses[i]);
-                    continue;
-                }
-                ssize_t bytes_sent = sendto(socket_fd, heartbeat_message, message_length, 0,
-                                           (struct sockaddr *)&dest_addr, (socklen_t)sizeof(dest_addr));
-                if (bytes_sent < 0) {
-                    /* A send failure typically indicates a local error (e.g., no
-                     * route) because UDP has no connection state.  Close the
-                     * socket and trigger a reconnect sequence. */
-                    perror("leader: sendto");
-                    close(socket_fd);
-                    socket_fd = -1;
-                    break;
-                } else {
-                    printf("leader: sent heartbeat to %s\n", follower_addresses[i]);
-                }
+        NetInfo followers[MAX_FOLLOWERS];
+        int follower_count_snapshot = snapshot_followers(followers, MAX_FOLLOWERS);
+
+        if (follower_count_snapshot == 0) {
+            if (!waiting_logged) {
+                printf("[LEADER] waiting for followers to register...\n");
+                waiting_logged = 1;
             }
-            /* Pause before sending the next heartbeat. */
             sleep_for_milliseconds(HEARTBEAT_INTERVAL_MS);
-        } else {
-            /* Socket is closed due to an error – attempt to recreate it. */
-            reconnect_attempts++;
-            if (reconnect_attempts > MAX_RECONNECT_ATTEMPTS) {
-                fprintf(stderr, "leader: unable to reconnect, giving up\n");
-                running = 0;
-                break;
-            }
-            fprintf(stderr, "leader: send failed; reconnecting attempt %d/%d\n",
-                    reconnect_attempts, MAX_RECONNECT_ATTEMPTS);
-            sleep_for_milliseconds(RECONNECT_DELAY_MS);
-            socket_fd = socket(AF_INET, SOCK_DGRAM, 0);
-            if (socket_fd < 0) {
-                perror("leader: socket (reconnect)");
+            continue;
+        }
+        waiting_logged = 0;
+
+        int send_failed = 0;
+
+        for (int i = 0; i < follower_count_snapshot; i++) {
+            if (followers[i].udp_port == 0 || followers[i].ip[0] == '\0') {
+                fprintf(stderr, "leader: follower %d has empty address\n", i);
                 continue;
             }
+
+            struct sockaddr_in dest;
+            memset(&dest, 0, sizeof(dest));
+            dest.sin_family = AF_INET;
+            dest.sin_port   = htons(followers[i].udp_port);
+
+            if (inet_pton(AF_INET, followers[i].ip, &dest.sin_addr) <= 0) {
+                fprintf(stderr, "leader: invalid follower IP: %s\n", followers[i].ip);
+                continue;
+            }
+
+            ssize_t sent = sendto(sock,
+                                  heartbeat_msg,
+                                  strlen(heartbeat_msg),
+                                  0,
+                                  (struct sockaddr *)&dest,
+                                  sizeof(dest));
+
+            if (sent < 0) {
+                perror("leader: sendto");
+                send_failed = 1;
+                break;
+            } else {
+                printf("[LEADER] sent heartbeat to %s:%d\n",
+                       followers[i].ip, followers[i].udp_port);
+            }
+        }
+
+        if (!send_failed) {
+            reconnect_attempts = 0;
+            sleep_for_milliseconds(HEARTBEAT_INTERVAL_MS);
+            continue;
+        }
+
+        reconnect_attempts++;
+        if (reconnect_attempts >= MAX_RECONNECT_ATTEMPTS) {
+            printf("[LEADER] connection with leader failed (gave up after %d tries)\n",
+                   MAX_RECONNECT_ATTEMPTS);
+            running = 0;
+            break;
+        }
+
+        printf("[LEADER] send failed -> retry %d/%d after %d ms\n",
+               reconnect_attempts, MAX_RECONNECT_ATTEMPTS, RECONNECT_DELAY_MS);
+
+        sleep_for_milliseconds(RECONNECT_DELAY_MS);
+
+        close(sock);
+        sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock < 0) {
+            perror("leader: socket (reconnect)");
         }
     }
 
-    if (socket_fd >= 0) {
-        close(socket_fd);
-    }
-    printf("leader: heartbeat thread exiting\n");
+    if (sock >= 0) close(sock);
+    printf("[LEADER] sender thread stopped\n");
     return NULL;
 }
 
-/*
- * Follower monitoring thread
- */
+/* ------------------- THREAD 2: FOLLOWER MONITORS HEARTBEAT ------------------- */
 static void *followerMonitorThread(void *arg)
 {
     (void)arg;
-    int socket_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (socket_fd < 0) {
+
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
         perror("follower: socket");
         return NULL;
     }
 
-    /* Bind the socket to all local interfaces on FOLLOWER_LISTEN_PORT【502487870642587†L48-L51】. */
-    struct sockaddr_in localAddr;
-    memset(&localAddr, 0, sizeof(localAddr));
-    localAddr.sin_family = AF_INET;
-    localAddr.sin_addr.s_addr = htonl(INADDR_ANY);
-    localAddr.sin_port = htons(FOLLOWER_LISTEN_PORT);
-    if (bind(socket_fd, (struct sockaddr *)&localAddr, sizeof(localAddr)) < 0) {
+    int opt = 1;
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt, sizeof(opt));
+
+    struct sockaddr_in local;
+    memset(&local, 0, sizeof(local));
+    local.sin_family      = AF_INET;
+    local.sin_addr.s_addr = htonl(INADDR_ANY);
+    local.sin_port        = htons(follower_listen_port);
+
+    if (bind(sock, (struct sockaddr *)&local, sizeof(local)) < 0) {
         perror("follower: bind");
-        close(socket_fd);
+        close(sock);
         return NULL;
     }
 
-    /* Set a small receive timeout so that recvfrom() does not block
-     * indefinitely when there is no traffic.  This allows the thread
-     * to periodically check the elapsed time. */
-    struct timeval tv;
-    tv.tv_sec = 0;
-    tv.tv_usec = 100000;  /* 100 ms */
-    if (setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
-        perror("follower: setsockopt");
-        /* Continue anyway – the socket will block but the heartbeat
-         * monitoring logic still works, albeit with coarser granularity. */
-    }
+    printf("[FOLLOWER] listening for heartbeats on UDP port %d\n", follower_listen_port);
 
-    /* Buffer to hold incoming UDP data. */
-    char receive_buffer[256];
-    /* Keep track of the last status we reported so we only print
-     * status changes.  -1 means no status has been printed yet. */
-    int last_reported_status = -1;
-    /* Initialize last_heartbeat_time to the current time so that
-     * initial timeouts are measured relative to program start. */
+    struct timeval tv;
+    tv.tv_sec  = 0;
+    tv.tv_usec = 100000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    char buf[256];
+    int last_reported = -1;
+    int reconnect_attempts = 0;
+    int gave_up = 0;
+    int reconnect_succeeded = 0;
+    struct timespec last_reconnect_time;
+
     clock_gettime(CLOCK_MONOTONIC, &last_heartbeat_time);
+    last_reconnect_time = last_heartbeat_time;
 
     while (1) {
-        struct sockaddr_in srcAddr;
-        socklen_t srcLen = sizeof(srcAddr);
-        ssize_t bytes_received = recvfrom(socket_fd, receive_buffer, sizeof(receive_buffer) - 1, 0,
-                                         (struct sockaddr *)&srcAddr, &srcLen);
-        if (bytes_received > 0) {
-            /* Null‑terminate the received data so strstr() works on it */
-            receive_buffer[bytes_received] = '\0';
-            /* If the message contains the leader heartbeat string, update the timestamp. */
-            if (strstr(receive_buffer, "Leader Active") != NULL) {
-                /* Record the arrival time of this heartbeat and mark
-                 * the leader as alive.  Protect the shared state with
-                 * the heartbeat mutex so both variables are updated
-                 * atomically. */
+        ssize_t n = recvfrom(sock, buf, sizeof(buf) - 1, 0, NULL, NULL);
+        if (n > 0) {
+            buf[n] = '\0';
+
+            if (strstr(buf, "Leader Active") != NULL) {
                 pthread_mutex_lock(&heartbeat_mutex);
                 clock_gettime(CLOCK_MONOTONIC, &last_heartbeat_time);
                 is_leader_active = 1;
                 pthread_mutex_unlock(&heartbeat_mutex);
-                /* Print once per message for debugging. */
-                printf("follower: received heartbeat from leader\n");
+
+                printf("[FOLLOWER] received heartbeat: \"%s\"\n", buf);
+                reconnect_attempts = 0;
+                gave_up = 0;
+                reconnect_succeeded = 0;
             }
         }
-        /* Compute the time since the last heartbeat. */
+
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
+
         pthread_mutex_lock(&heartbeat_mutex);
-        double elapsed_ms = (now.tv_sec - last_heartbeat_time.tv_sec) * 1000.0 +
-                            (now.tv_nsec - last_heartbeat_time.tv_nsec) / 1e6;
-        /* If no heartbeat has been seen within the timeout window,
-         * mark the leader as inactive; otherwise mark it active. */
-        if (elapsed_ms > HEARTBEAT_TIMEOUT_MS) {
+        double elapsed = ms_since(now, last_heartbeat_time);
+        if (elapsed > HEARTBEAT_TIMEOUT_MS) {
             is_leader_active = 0;
         } else {
             is_leader_active = 1;
         }
-        int current_status = is_leader_active;
+        int current = is_leader_active;
         pthread_mutex_unlock(&heartbeat_mutex);
-        /* Report status transitions only. */
-        if (current_status != last_reported_status) {
-            if (current_status) {
-                printf("follower: leader is active\n");
-            } else {
-                printf("follower: leader is disconnected from followers\n");
+
+        if (current != last_reported) {
+            if (current) {
+                printf("[FOLLOWER] leader is active\n");
             }
-            last_reported_status = current_status;
+            last_reported = current;
         }
-        /* Small sleep to avoid busy waiting. */
+
+        if (!current && !gave_up && !reconnect_succeeded) {
+            double since_reconnect = ms_since(now, last_reconnect_time);
+            if (since_reconnect >= RECONNECT_DELAY_MS) {
+                last_reconnect_time = now;
+
+                if (follower_reconnect() == 0) {
+                    printf("[FOLLOWER] reconnect successful\n");
+                    reconnect_attempts = 0;
+                    reconnect_succeeded = 1;
+                } else {
+                    reconnect_attempts++;
+                    printf("[FOLLOWER] reconnect attempt %d/%d failed\n",
+                           reconnect_attempts, MAX_RECONNECT_ATTEMPTS);
+                    if (reconnect_attempts >= MAX_RECONNECT_ATTEMPTS) {
+                        printf("[FOLLOWER] leader is disconnected from followers (timeout > %d ms)\n",
+                               HEARTBEAT_TIMEOUT_MS);
+                        gave_up = 1;
+                    }
+                }
+            }
+        }
+
         sleep_for_milliseconds(50);
     }
 
-    /* Unreachable: the loop above is infinite.  If a shutdown condition
-     * is needed, add logic to break out of the loop and close the socket. */
-    close(socket_fd);
+    close(sock);
     return NULL;
 }
 
-int main(void)
+/* ------------------- MAIN ------------------- */
+int main(int argc, char **argv)
 {
-    /* Create the leader and follower threads.  The POSIX function
-     * pthread_create() starts a new thread and invokes the given
-     * start_routine(), passing arg as its argument【660345157720278†L30-L36】.
-     * The function returns 0 on success or an error number on failure. */
-    /* Thread identifiers for the leader (sender) and follower (monitor) threads */
-    pthread_t sender_thread;
-    pthread_t monitor_thread;
+    RunMode mode = MODE_BOTH;
+    const char *leader_ip = LEADER_IP;
+    uint16_t leader_port = LEADER_PORT;
+    const char *self_ip = LEADER_IP;
+    uint16_t listen_port = FOLLOWER_DEFAULT_LISTEN_PORT;
 
-    int ret;
-    /* Create the leader heartbeat thread.  This thread will send
-     * heartbeats until it either encounters repeated errors or the
-     * program is terminated. */
-    ret = pthread_create(&sender_thread, NULL, leaderHeartbeatThread, NULL);
-    if (ret != 0) {
-        fprintf(stderr, "main: failed to create sender thread: %s\n", strerror(ret));
-        return EXIT_FAILURE;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--leader") == 0) {
+            mode = MODE_LEADER;
+        } else if (strcmp(argv[i], "--follower") == 0) {
+            mode = MODE_FOLLOWER;
+        } else if (strcmp(argv[i], "--both") == 0) {
+            mode = MODE_BOTH;
+        } else if (strcmp(argv[i], "--listen-port") == 0 && i + 1 < argc) {
+            if (parse_port(argv[++i], &listen_port) != 0) {
+                fprintf(stderr, "invalid listen port\n");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--leader-ip") == 0 && i + 1 < argc) {
+            leader_ip = argv[++i];
+        } else if (strcmp(argv[i], "--leader-port") == 0 && i + 1 < argc) {
+            if (parse_port(argv[++i], &leader_port) != 0) {
+                fprintf(stderr, "invalid leader port\n");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--self-ip") == 0 && i + 1 < argc) {
+            self_ip = argv[++i];
+        } else if (strcmp(argv[i], "--help") == 0) {
+            print_usage(argv[0]);
+            return 0;
+        } else {
+            fprintf(stderr, "unknown argument: %s\n", argv[i]);
+            print_usage(argv[0]);
+            return 1;
+        }
     }
 
-    /* Create the follower monitoring thread.  This thread runs
-     * indefinitely and updates the is_leader_active flag based on
-     * incoming heartbeats. */
-    ret = pthread_create(&monitor_thread, NULL, followerMonitorThread, NULL);
-    if (ret != 0) {
-        fprintf(stderr, "main: failed to create monitor thread: %s\n", strerror(ret));
-        return EXIT_FAILURE;
+    strncpy(follower_leader_ip, leader_ip, sizeof(follower_leader_ip) - 1);
+    follower_leader_ip[sizeof(follower_leader_ip) - 1] = '\0';
+    strncpy(follower_self_ip, self_ip, sizeof(follower_self_ip) - 1);
+    follower_self_ip[sizeof(follower_self_ip) - 1] = '\0';
+    follower_leader_port = leader_port;
+
+    pthread_t leader_thread;
+    pthread_t follower_thread;
+    pthread_t leader_runtime_thread;
+    int start_leader = (mode == MODE_LEADER || mode == MODE_BOTH);
+    int start_follower = (mode == MODE_FOLLOWER || mode == MODE_BOTH);
+
+    if (start_leader) {
+        if (pthread_create(&leader_runtime_thread, NULL, leaderRuntimeThread, NULL) != 0) {
+            perror("pthread_create leader runtime");
+            return 1;
+        }
+
+        if (wait_for_leader_ready() < 0) {
+            fprintf(stderr, "leader failed to start\n");
+            return 1;
+        }
+
+        if (pthread_create(&leader_thread, NULL, leaderHeartbeatThread, NULL) != 0) {
+            perror("pthread_create leader heartbeat");
+            return 1;
+        }
     }
 
-    /* Wait for the sender thread to finish.  In this demonstration the
-     * sender thread will terminate only if repeated send failures occur.
-     * The monitor thread runs indefinitely.  In a real application you
-     * would coordinate thread termination using additional flags or
-     * signals. */
-    pthread_join(sender_thread, NULL);
-    /* Optionally wait on monitor_thread.  This program will never
-     * reach here because monitor_thread has an infinite loop. */
-    pthread_join(monitor_thread, NULL);
-    return EXIT_SUCCESS;
+    if (start_follower) {
+        follower_listen_port = listen_port;
+
+        leader_tcp_fd = connect_to_leader(leader_ip, leader_port);
+        if (leader_tcp_fd < 0) {
+            return 1;
+        }
+
+        if (register_with_leader(leader_tcp_fd, self_ip, follower_listen_port) != 0) {
+            close(leader_tcp_fd);
+            return 1;
+        }
+
+        if (pthread_create(&follower_thread, NULL, followerMonitorThread, NULL) != 0) {
+            perror("pthread_create follower heartbeat");
+            close(leader_tcp_fd);
+            return 1;
+        }
+    }
+
+    if (start_leader) {
+        pthread_join(leader_thread, NULL);
+        pthread_join(leader_runtime_thread, NULL);
+    }
+
+    if (start_follower) {
+        pthread_join(follower_thread, NULL);
+    }
+
+    if (leader_tcp_fd >= 0) {
+        close(leader_tcp_fd);
+    }
+
+    return 0;
 }
