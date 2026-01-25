@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/timerfd.h>
 
 #include "truckplatoon.h"
 #include "event.h"
@@ -52,10 +53,51 @@ void propagate_emergency(void){
 }
 
 
+
+
+
+// Emergency Timer thread 
+void* emergency_timer_thread(void* arg) {
+    uint32_t duration_ms = *(uint32_t*)arg;
+    free(arg);
+
+    int tfd = timerfd_create(CLOCK_MONOTONIC, 0);
+    if (tfd < 0) {
+        perror("timerfd_create");
+        return NULL;
+    }
+
+    struct itimerspec its = {0};
+    its.it_value.tv_sec  = duration_ms / 1000;
+    its.it_value.tv_nsec = (duration_ms % 1000) * 1000000;
+
+    timerfd_settime(tfd, 0, &its, NULL);
+
+    uint64_t expirations;
+    read(tfd, &expirations, sizeof(expirations));
+
+    Event e = {.type = EVT_EMERGENCY_TIMER};
+    push_event(&truck_EventQ, &e);
+
+    close(tfd);
+    return NULL;
+}
+
+//Start energency Timer 
+
+void start_emergency_timer(uint32_t duration_ms) {
+    pthread_t tid;
+    uint32_t* arg = malloc(sizeof(uint32_t));
+    *arg = duration_ms;
+
+    pthread_create(&tid, NULL, emergency_timer_thread, arg);
+    pthread_detach(tid);
+}
+
 // FUNC: Entry Actions for emergency Brake 
 void enter_emergency(void) {
     follower.state = EMERGENCY_BRAKE;
     follower.speed = 0;
-    brake_start_time = time(NULL);
     propagate_emergency();
+    start_emergency_timer(5000);   
 }

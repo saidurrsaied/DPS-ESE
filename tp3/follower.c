@@ -28,7 +28,6 @@
 #include "follower.h"
 #include "tpnet.h"
 
-#define INTRUDER_PROB 10   // %
 
 //TRUCK
 Truck follower;
@@ -46,8 +45,6 @@ EventQueue truck_EventQ;
 int udp_sock;
 int32_t tcp2Leader;
 
-// Timer to track when braking started
-time_t brake_start_time = 0; 
 
 int main(int argc, char* argv[]) {
 
@@ -219,21 +216,6 @@ void* truck_state_machine(void* arg) {
     }
 }
 
-
-
-
-
-//FUNC: Functioon to recover from emergenxy state 
-
-void handle_timer(void){
-    if (follower.state == EMERGENCY_BRAKE) {
-        double elapsed = difftime(time(NULL), brake_start_time);
-        if (elapsed >= 5.0) {
-            follower.state = CRUISE;
-            printf("[STATE] Emergency cleared → CRUISE\n");
-        }
-    }
-}
 
 
 

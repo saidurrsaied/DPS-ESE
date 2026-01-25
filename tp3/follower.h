@@ -25,8 +25,7 @@ extern EventQueue truck_EventQ;
 extern int udp_sock;
 extern int32_t tcp2Leader;
 
-/* Timer tracking */
-extern time_t brake_start_time;
+
 
 /* Thread Functions */
 void* udp_listener(void* arg);
