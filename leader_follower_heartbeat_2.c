@@ -24,7 +24,7 @@
 #define RECONNECT_DELAY_MS      500
 #define MAX_RECONNECT_ATTEMPTS  10
 
-#define HEARTBEAT_TIMEOUT_MS    2000
+#define HEARTBEAT_TIMEOUT_MS    5000
 #define FOLLOWER_DEFAULT_LISTEN_PORT 6000
 
 /* ------------------- SHARED STATE ------------------- */
