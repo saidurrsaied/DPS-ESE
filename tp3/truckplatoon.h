@@ -16,6 +16,9 @@
 #define MAX_FOLLOWERS 5
 #define CMD_QUEUE_SIZE 10
 
+#define SIM_DT 0.1f
+#define TARGET_GAP 10.0f
+
 /* Directions & States */
 typedef enum {
     NORTH,
@@ -54,9 +57,9 @@ typedef enum {
 
 /* Truck struct */
 typedef struct {
-    int32_t x;
-    int32_t y;
-    int32_t speed;
+    float x;
+    float y;
+    float speed;
     DIRECTION dir;
     TRUCK_CONTROL_STATE state;
 } Truck;
@@ -71,6 +74,10 @@ typedef struct {
 typedef struct {
     uint64_t command_id;
     Truck leader;
+    int is_turning_event;
+    float turn_point_x;
+    float turn_point_y;
+    DIRECTION turn_dir;
 } LeaderCommand;
 
 /* Registration message*/
@@ -109,8 +116,9 @@ typedef struct {
 
 /* Front Truck UDP Message Typedefs */
 typedef struct {
-    int32_t x; 
-    int32_t y; 
+    float x; 
+    float y; 
+    float speed;
 }FT_POSITION; 
 
 typedef struct {

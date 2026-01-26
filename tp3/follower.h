@@ -3,9 +3,11 @@
 
 #define _POSIX_C_SOURCE 200809L
 
-#include "truckplatoon.h"
 #include "event.h"
 #include "tpnet.h"
+#include "truckplatoon.h"
+#include "cruise_control.h"
+#include "turning.h"
 #include <pthread.h>
 #include <time.h>
 
@@ -20,6 +22,7 @@ extern pthread_t udp_tid, tcp_tid, sm_tid;
 
 /* Event Queue */
 extern EventQueue truck_EventQ;
+extern TurnQueue follower_turns;
 
 /* Sockets */
 extern int udp_sock;

@@ -18,6 +18,8 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 
+#include <termios.h>
+
 #include "truckplatoon.h"
 
 int leader_socket_fd;
@@ -28,24 +30,35 @@ int follower_count = 0;
 pthread_mutex_t mutex_client_fd_list;
 pthread_t sender_tid;
 pthread_t acceptor_tid;
+pthread_t input_tid;
 
 Truck leader;
 uint64_t cmd_id = 0;
 CommandQueue cmd_queue; 
 
+/* Turn Event Tracking */
+int pending_turn = 0;
+DIRECTION next_turn_dir;
+int user_started = 0;
+
 void* accept_handler(void* arg);
 void* send_handler(void* arg);
-void leader_decide_next_state(Truck* t);
 void move_truck(Truck* t);
 void queue_commands(LeaderCommand* ldr_cmd);
+void *input_handler(void *arg);
 
 int main(void) {
     srand(time(NULL));
     pthread_mutex_init(&mutex_client_fd_list, NULL);
 
-    leader = (Truck){0,0,1,NORTH,CRUISE};
-
+    //leader = (Truck){0,0,1,NORTH,CRUISE};
+  leader = (Truck){
+      .x = 0.0f, .y = 0.0f, .speed = 0.0f, .dir = NORTH, .state = STOPPED};
+      
     leader_socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+
+  int opt = 1;
+  setsockopt(leader_socket_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
@@ -76,26 +89,61 @@ int main(void) {
     if (pthread_create(&sender_tid, NULL, send_handler, NULL) != 0) {
         perror("pthread_create sender");
         return 1;
+    }    
+    if (pthread_create(&input_tid, NULL, input_handler, NULL) != 0) {
+        perror("pthread_create input");
+        return 1;
     }
 
-    printf("Leader started\n");
+  printf("Leader started. Controls: [w/s] Speed, [a/d] Turn, [space] Brake, "
+         "[q] Quit\n");
 
-    while (1) {
-        leader_decide_next_state(&leader);
-        move_truck(&leader);
+  struct timespec next_tick;
+  clock_gettime(CLOCK_MONOTONIC, &next_tick);
 
-        LeaderCommand ldr_cmd = {
-            .command_id = cmd_id++,
-            .leader = leader
-        };
-        
-        queue_commands(&ldr_cmd);
-
-        printf("Leader pos (%d,%d), sent command: %lu \n", leader.x, leader.y, cmd_id);
-        fflush(stdout);
-
-        sleep(LEADER_SLEEP);
+while (1) {
+    next_tick.tv_nsec += (long)(SIM_DT * 1e9);
+    if (next_tick.tv_nsec >= 1e9) {
+      next_tick.tv_sec += 1;
+      next_tick.tv_nsec -= 1e9;
     }
+
+    pthread_mutex_lock(&mutex_client_fd_list);
+
+    if (user_started) {
+      LeaderCommand ldr_cmd = {.command_id = ++cmd_id, .is_turning_event = 0};
+
+      if (pending_turn) {
+        ldr_cmd.is_turning_event = 1;
+        ldr_cmd.turn_point_x = leader.x;
+        ldr_cmd.turn_point_y = leader.y;
+        ldr_cmd.turn_dir = next_turn_dir;
+
+        leader.dir = next_turn_dir;
+        leader.state = TURNING;
+        pending_turn = 0;
+        printf("\n[TURN] Leader at (%.2f, %.2f) to %d\n", ldr_cmd.turn_point_x,
+               ldr_cmd.turn_point_y, next_turn_dir);
+      } else if (leader.speed == 0 && leader.state != EMERGENCY_BRAKE) {
+        leader.state = STOPPED;
+      } else if (leader.state == TURNING) {
+        leader.state = CRUISE;
+      }
+
+      move_truck(&leader);
+      ldr_cmd.leader = leader;
+
+      queue_commands(&ldr_cmd);
+
+      printf("\rLeader: POS(%.1f,%.1f) SPD=%.1f DIR=%d STATE=%d    ", leader.x,
+             leader.y, leader.speed, leader.dir, leader.state);
+      fflush(stdout);
+    }
+
+    pthread_mutex_unlock(&mutex_client_fd_list);
+
+    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_tick, NULL);
+  }
 }
 
 
@@ -139,48 +187,63 @@ void* accept_handler(void* arg) {
 }
 
 
-/*  Leader logic */
-void leader_decide_next_state(Truck* t) {
-    int r = rand() % 100;
+/* Keyboard Input Handler */
+void *input_handler(void *arg) {
+  (void)arg;
+  struct termios oldt, newt;
+  tcgetattr(STDIN_FILENO, &oldt);
+  newt = oldt;
+  newt.c_lflag &= ~(ICANON | ECHO);
+  tcsetattr(STDIN_FILENO, TCSANOW, &newt);
 
-    if (r < 2) {
-        t->state = EMERGENCY_BRAKE;
-        t->speed = 0;
-        return;
+  while (1) {
+    char c = getchar();
+    pthread_mutex_lock(&mutex_client_fd_list);
+    user_started = 1;
+    if (c == 'w') {
+      leader.speed += 0.5f;
+      leader.state = ACCELERATE;
+    } else if (c == 's') {
+      leader.speed -= 0.5f;
+      if (leader.speed < 0)
+        leader.speed = 0;
+      leader.state = DECELERATE;
+    } else if (c == 'a') {
+      next_turn_dir = (leader.dir + 3) % 4; // Left
+      pending_turn = 1;
+    } else if (c == 'd') {
+      next_turn_dir = (leader.dir + 1) % 4; // Right
+      pending_turn = 1;
+    } else if (c == ' ') {
+      leader.speed = 0;
+      leader.state = EMERGENCY_BRAKE;
+    } else if (c == 'q') {
+      tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+      exit(0);
     }
-
-    if (r < 7) {
-        t->state = TURNING;
-        t->dir = (rand() % 2)
-                   ? (t->dir + 1) % 4
-                   : (t->dir + 3) % 4;
-        return;
-    }
-
-    if (r < 17) {
-        t->state = ACCELERATE;
-        if (t->speed < 3) t->speed++;
-        return;
-    }
-
-    if (r < 27) {
-        t->state = DECELERATE;
-        if (t->speed > 1) t->speed--;
-        return;
-    }
-
-    t->state = CRUISE;
+    pthread_mutex_unlock(&mutex_client_fd_list);
+  }
+  return NULL;
 }
 
-void move_truck(Truck* t) {
-    for (int i = 0; i < t->speed; i++) {
-        switch (t->dir) {
-            case NORTH: t->y++; break;
-            case SOUTH: t->y--; break;
-            case EAST:  t->x++; break;
-            case WEST:  t->x--; break;
-        }
-    }
+void move_truck(Truck *t) {
+  float dx = 0, dy = 0;
+  switch (t->dir) {
+  case NORTH:
+    dy = t->speed * SIM_DT;
+    break;
+  case SOUTH:
+    dy = -t->speed * SIM_DT;
+    break;
+  case EAST:
+    dx = t->speed * SIM_DT;
+    break;
+  case WEST:
+    dx = -t->speed * SIM_DT;
+    break;
+  }
+  t->x += dx;
+  t->y += dy;
 }
 
 //Helper function for queuing commands 
