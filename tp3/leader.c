@@ -211,9 +211,11 @@ void *input_handler(void *arg) {
     } else if (c == 'a') {
       next_turn_dir = (leader.dir + 3) % 4; // Left
       pending_turn = 1;
+      leader.state = TURNING;
     } else if (c == 'd') {
       next_turn_dir = (leader.dir + 1) % 4; // Right
       pending_turn = 1;
+      leader.state = TURNING;
     } else if (c == ' ') {
       leader.speed = 0;
       leader.state = EMERGENCY_BRAKE;
