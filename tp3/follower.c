@@ -52,7 +52,6 @@ Truck front_ref;
 float front_speed = 0;
 float leader_base_speed = 0;
 
-
 // SOCKET RELATED
 int udp_sock;
 int32_t tcp2Leader;
@@ -102,15 +101,12 @@ int main(int argc, char* argv[]) {
     pthread_create(&tcp_tid, NULL, tcp_listener, NULL);
     pthread_create(&sm_tid, NULL, truck_state_machine, NULL);
    
-
-
     //Scheduling policy and prioroty 
             /*
             set_realtime_priority(sm_tid,  SCHED_FIFO, 80); // state machine
             set_realtime_priority(udp_tid, SCHED_FIFO, 70); // emergency RX
             set_realtime_priority(tcp_tid, SCHED_FIFO, 60); // cruise RX
             */
-
 
   struct timespec next_tick;
   clock_gettime(CLOCK_MONOTONIC, &next_tick);
@@ -122,10 +118,26 @@ int main(int argc, char* argv[]) {
       next_tick.tv_nsec -= 1e9;
     }
 
-    // 1. Move & Turn (at 10Hz)
+    // 1. Driving Brain (Control Calculation at 10Hz)
+    // We only recalculate speed here if we are in a normal driving state.
+    // This provides perfect 10Hz sync and avoids high-speed gap errors.
+    if (follower.state != EMERGENCY_BRAKE &&
+        follower.state != INTRUDER_FOLLOW) {
+      follower.speed = cruise_control_calculate_speed(
+          follower.speed, front_ref.x, front_ref.y, front_speed,
+          leader_base_speed, follower.x, follower.y);
+
+      if (follower.speed > 0.01f) {
+        follower.state = CRUISE;
+      } else {
+        follower.state = STOPPED;
+      }
+    }
+
+    // 2. Move & Turn (at 10Hz)
     move_truck(&follower, SIM_DT, &follower_turns);
 
-    // 2. Status updates and other logic
+    //Status updates and other logic
     broadcast_status();
     //handle_timer(); // recover from emergency if needed
 
@@ -143,32 +155,29 @@ int main(int argc, char* argv[]) {
     return 0;
 }
 
-
-
 // Dedicated thread for listening to UDP emergency messages from other trucks
-void* udp_listener(void* arg) {
+void *udp_listener(void *arg) {
   (void)arg;
   FT_MESSAGE msg;
   while (1) {
-    FT_MESSAGE msg;
-    recvfrom(udp_sock, &msg, sizeof(msg), 0, NULL, NULL);
+    ssize_t ret = recvfrom(udp_sock, &msg, sizeof(msg), 0, NULL, NULL);
+    if (ret == sizeof(msg)) {
+      switch (msg.type) {
+      case MSG_FT_EMERGENCY_BRAKE:
+        Event emergency_evt = {.type = EVT_EMERGENCY};
+        push_event(&truck_EventQ, &emergency_evt);
+        break;
 
-    switch (msg.type) {
-        case MSG_FT_EMERGENCY_BRAKE:
-            Event emergency_evt = {.type = EVT_EMERGENCY};
-            push_event(&truck_EventQ, &emergency_evt);
-            break;
-
-        case MSG_FT_POSITION:
-            Event distance_evt = {.type = EVT_DISTANCE};
-            distance_evt.event_data.ft_pos = msg.payload.position;
-            push_event(&truck_EventQ, &distance_evt);
-            break;
+      case MSG_FT_POSITION:
+        Event distance_evt = {.type = EVT_DISTANCE};
+        distance_evt.event_data.ft_pos = msg.payload.position;
+        push_event(&truck_EventQ, &distance_evt);
+        break;
       }
+    }
   }
   return NULL;
 }
-
 
 //FUNC: TCP Listener 
 void* tcp_listener(void* arg) {
@@ -228,10 +237,6 @@ void* truck_state_machine(void* arg) {
           front_ref = evnt.event_data.leader_cmd.leader;
           front_speed = front_ref.speed;
         }
-        // Calculate speed based on new data
-        follower.speed = cruise_control_calculate_speed(
-            follower.speed, front_ref.x, front_ref.y, front_speed,
-            leader_base_speed, follower.x, follower.y);
         break;
 
       case EVT_DISTANCE:
@@ -241,10 +246,6 @@ void* truck_state_machine(void* arg) {
           front_ref.y = evnt.event_data.ft_pos.y;
           front_speed = evnt.event_data.ft_pos.speed;
         }
-        // Calculate speed based on new data
-        follower.speed = cruise_control_calculate_speed(
-            follower.speed, front_ref.x, front_ref.y, front_speed,
-            leader_base_speed, follower.x, follower.y);
         break;
         
             case EVT_INTRUDER:
