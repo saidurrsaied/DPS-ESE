@@ -101,3 +101,7 @@ void enter_emergency(void) {
     propagate_emergency();
     start_emergency_timer(5000);   
 }
+
+void exit_emergency(void){
+    follower.state = CRUISE; 
+}

@@ -16,7 +16,7 @@ LEADER_OBJS = $(LEADER_SRCS:.c=.o)
 LEADER_EXEC = leader
 
 # Headers
-HEADERS = truckplatoon.h event.h follower.h tpnet.h
+HEADERS = truckplatoon.h event.h follower.h tpnet.h intruder.h
 
 # Default target
 all: $(FOLLOWER_EXEC) $(LEADER_EXEC)

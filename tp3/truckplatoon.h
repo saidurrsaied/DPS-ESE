@@ -44,12 +44,12 @@ typedef enum {
 
 typedef enum {
     CRUISE,
-    ACCELERATE,
-    DECELERATE,
-    TURNING,
     EMERGENCY_BRAKE,
     STOPPED, 
-    INTRUDER_FOLLOW
+    INTRUDER_FOLLOW, 
+    TURNING, 
+    ACCELERATE,
+    DECELERATE
 } TRUCK_CONTROL_STATE;
 
 /* Truck struct */

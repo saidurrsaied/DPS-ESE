@@ -27,6 +27,7 @@ int32_t join_platoon(int32_t leader_FD, const char *self_ip, uint16_t self_port)
     if(platoon_join_status <0){
         printf("Platoon join failed"); 
     }
+    printf("Joined Platoon \n"); 
     return platoon_join_status; 
 }
 
@@ -54,6 +55,7 @@ int32_t connect2Leader(){
         perror("Connection to leader failed");
         return status;
     }
+    printf("Connected to Leader\n");
     // If creation and connection succeeds, return the socket fd
     return leader_fd;
 }

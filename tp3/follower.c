@@ -27,6 +27,7 @@
 #include "event.h"
 #include "follower.h"
 #include "tpnet.h"
+#include "intruder.h"
 
 
 //TRUCK
@@ -39,6 +40,7 @@ int8_t simulation_running = 1;
 //THREAD RELATED 
 pthread_t tid;
 pthread_t udp_tid, tcp_tid, sm_tid;
+pthread_t intruder_tid; //meghana
 EventQueue truck_EventQ;
 
 // SOCKET RELATED
@@ -75,6 +77,8 @@ int main(int argc, char* argv[]) {
     pthread_create(&udp_tid, NULL, udp_listener, NULL);
     pthread_create(&tcp_tid, NULL, tcp_listener, NULL);
     pthread_create(&sm_tid, NULL, truck_state_machine, NULL);
+    pthread_create(&intruder_tid, NULL, keyboard_listener, NULL);//meghana
+    printf("Created Threads...\n");
    
 
 
@@ -86,9 +90,9 @@ int main(int argc, char* argv[]) {
             */
 
 
-    while(simulation_running){
-        maybe_intruder(); 
-        sleep(2); 
+    while(1){
+        
+        //YOU WAIT HERE 
     }
     close(tcp2Leader);
     close(udp_sock);
@@ -100,19 +104,25 @@ int main(int argc, char* argv[]) {
 // Dedicated thread for listening to UDP emergency messages from other trucks
 void* udp_listener(void* arg) {
     FT_MESSAGE msg;
-    recvfrom(udp_sock, &msg, sizeof(msg), 0, NULL, NULL);
+    while(1){
+        printf("[UDP]"); 
+        recvfrom(udp_sock, &msg, sizeof(msg), 0, NULL, NULL);
 
-    switch (msg.type) {
-        case MSG_FT_EMERGENCY_BRAKE:
-            Event emergency_evt = {.type = EVT_EMERGENCY};
-            push_event(&truck_EventQ, &emergency_evt);
-            break;
+        switch (msg.type) {
+            case MSG_FT_EMERGENCY_BRAKE:
+                Event emergency_evt = {.type = EVT_EMERGENCY};
+                push_event(&truck_EventQ, &emergency_evt);
+                break;
 
-        case MSG_FT_POSITION:
-            Event distance_evt = {.type = EVT_DISTANCE};
-            distance_evt.event_data.ft_pos = msg.payload.position;
-            push_event(&truck_EventQ, &distance_evt);
-            break;
+            case MSG_FT_POSITION:
+                Event distance_evt = {.type = EVT_DISTANCE};
+                distance_evt.event_data.ft_pos = msg.payload.position;
+                push_event(&truck_EventQ, &distance_evt);
+                break;
+            case MSG_FT_INTRUDER_REPORT: 
+                // These type of message is not expected here
+                break;
+        }
     }
 }
 
@@ -122,6 +132,7 @@ void* tcp_listener(void* arg) {
     (void)arg; 
     LD_MESSAGE msg;
     while (1) {
+            printf("[TCP]"); 
             if (recv(tcp2Leader, &msg, sizeof(msg), 0) <= 0)
                 break;
 
@@ -151,11 +162,12 @@ void* tcp_listener(void* arg) {
 //FUNC: TRUCK State Machine Thread function
 void* truck_state_machine(void* arg) {
     while (1) {
+        printf("[FSM]"); 
         Event evnt = pop_event(&truck_EventQ);
 
         switch (follower.state) {
-
         case CRUISE:
+            printf("[STATE = CRUISE]"); 
             switch (evnt.type) {
 
             case EVT_CRUISE_CMD:
@@ -168,6 +180,7 @@ void* truck_state_machine(void* arg) {
                 //TODO: implement fnc to adjust speed to maintain distance with the front truck
 
             case EVT_INTRUDER:
+                notify_leader_intruder(evnt.event_data.intruder);
                 enter_intruder_follow(evnt.event_data.intruder);
                 break;
 
@@ -184,36 +197,62 @@ void* truck_state_machine(void* arg) {
             break;
 
         case INTRUDER_FOLLOW:
-            switch (evnt.type) {
+            printf("[STATE = INTRUDER_FOLLOW]"); 
+            switch (evnt.type) { 
+                case EVT_CRUISE_CMD: 
+                    push_event(&truck_EventQ,&evnt); //defere
+                    break;
+                case EVT_DISTANCE:
+                    push_event(&truck_EventQ,&evnt); //defere
+                    break;
+                case EVT_INTRUDER:
+                    // if intruder is detected again during intruder state, what to do ?
+                    update_intruder(evnt.event_data.intruder);               
+                    break;
 
-            case EVT_INTRUDER:
-                // if intruder is detected again during intruder state, what to do ?
-                update_intruder(evnt.event_data.intruder);
-                break;
+                case EVT_INTRUDER_CLEAR:
+                    exit_intruder_follow();
+                    IntruderInfo intruder_clear = {0};
+                    notify_leader_intruder(intruder_clear);
+                    break;
 
-            case EVT_INTRUDER_CLEAR:
-                exit_intruder_follow();
+                case EVT_EMERGENCY:
+                    enter_emergency();
+                    break;
+                case EVT_EMERGENCY_TIMER: 
+                    break; 
+                }
                 break;
-
-            case EVT_EMERGENCY:
-                enter_emergency();
-                break;
-            }
-            break;
 
         case EMERGENCY_BRAKE:
+            printf("[STATE = EMERGENCY_BRAKE]"); 
             switch (evnt.type) {
-            case EVT_EMERGENCY_TIMER:
-                    // exit emergency 
-                    // TODO:  implement exit_emergency() with proper transition action
-                break;
+                case EVT_CRUISE_CMD: 
+                    push_event(&truck_EventQ,&evnt); //defere
+                    break;
+                case EVT_DISTANCE:
+                    push_event(&truck_EventQ,&evnt); //defere
+                    break;
+                case EVT_INTRUDER: 
+                    push_event(&truck_EventQ,&evnt); //defere
+                    break;
+                case EVT_INTRUDER_CLEAR: 
+                    push_event(&truck_EventQ,&evnt); //defere
+                    break;
+                case EVT_EMERGENCY_TIMER:
+                        exit_emergency(); 
+                    break;
 
-            case EVT_EMERGENCY:
-                break; // remain in emergency and do nothing. wait for timeout 
+                case EVT_EMERGENCY:
+                    break; // remain in emergency and do nothing. wait for timeout 
             }
             break;
+        case STOPPED: 
+            printf("[STATE = EMERGENCY_BRAKE]"); 
+            
         }
     }
+    pthread_exit(pthread_self); // Check if correct
 }
 
 
