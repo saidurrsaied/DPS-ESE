@@ -23,14 +23,14 @@ float cruise_control_calculate_speed(float current_speed, float front_pos_x,
    */
   float projected_error = (static_gap - TARGET_GAP) - (front_speed * SIM_DT);
 
-  /* TUNING (Reference fl.c gains + User's preference)
+  /* TUNING
      Kp: 0.35 (Correction gain)
      Kd: 0.70 (Damping gain - Matches speeds)
   */
   float Kp = 0.35f;
   float Kd = 0.70f;
 
-  // 2. Control Law Structure (Matched to CC/fl.c)
+  // 2. Control Law Structure
   // New Speed = Leader Intent + Damping + Correction
   float base = leader_base_speed;
   float damping = (front_speed - current_speed) * Kd;
