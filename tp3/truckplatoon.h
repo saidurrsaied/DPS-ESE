@@ -8,6 +8,8 @@
 #include <stdint.h>
 #include <pthread.h>
 
+#include "matrix_clock.h"
+
 /* Networking*/
 #define LEADER_IP   "127.0.0.1"
 #define LEADER_PORT 5000 
@@ -125,6 +127,8 @@ typedef struct {
         FT_EMERGENCY warning; 
         IntruderInfo intruder; 
     }payload; 
+    
+    int matrix_clock[NUM_TRUCKS][NUM_TRUCKS];
 }FT_MESSAGE; 
 
 #endif

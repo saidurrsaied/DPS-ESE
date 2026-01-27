@@ -19,6 +19,7 @@
 #include <netinet/in.h>
 
 #include "truckplatoon.h"
+#include "matrix_clock.h"
 
 int leader_socket_fd;
 int follower_fd_list[MAX_FOLLOWERS];
@@ -33,6 +34,8 @@ Truck leader;
 uint64_t cmd_id = 0;
 CommandQueue cmd_queue; 
 
+MatrixClock leader_clock; //matrix clock declaration
+
 void* accept_handler(void* arg);
 void* send_handler(void* arg);
 void leader_decide_next_state(Truck* t);
@@ -46,6 +49,8 @@ int main(void) {
     leader = (Truck){0,0,1,NORTH,CRUISE};
 
     leader_socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+    
+    matrix_clock_init(&leader_clock, 0); // matrix clock
 
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
@@ -108,6 +113,11 @@ void* accept_handler(void* arg) {
 
         FollowerRegisterMsg reg_msg;
         recv(follower_fd, &reg_msg, sizeof(reg_msg), 0);
+        
+        /* Matrix clock*/
+        matrix_clock_on_receive(&leader_clock, msg.matrix_clock);
+        matrix_clock_print(&leader_clock, "Leader received message");
+		/**/
 
         pthread_mutex_lock(&mutex_client_fd_list);
         int id = follower_count;
@@ -120,6 +130,13 @@ void* accept_handler(void* arg) {
         LD_MESSAGE initialMsg = {0};
         initialMsg.type = MSG_LDR_UPDATE_REAR;
         initialMsg.payload.rearInfo.has_rearTruck = 0; // First connection has no rear
+        
+        /* Matrix clock*/
+        matrix_clock_on_send(&leader_clock);
+        memcpy(msg.matrix_clock, leader_clock.clock, sizeof(leader_clock.clock));
+        /**/
+        
+        
         send(follower_fd, &initialMsg, sizeof(initialMsg), 0);
 
         // If there is a previous follower, update it so its rear points to this new follower 
@@ -128,6 +145,13 @@ void* accept_handler(void* arg) {
             update_rearInfo.type = MSG_LDR_UPDATE_REAR;
             update_rearInfo.payload.rearInfo.rearTruck_Address = reg_msg.selfAddress;
             update_rearInfo.payload.rearInfo.has_rearTruck = 1; 
+            
+            /* Matrix clock*/
+        matrix_clock_on_send(&leader_clock);
+        memcpy(msg.matrix_clock, leader_clock.clock, sizeof(leader_clock.clock));
+        /**/
+            
+            
             send(follower_fd_list[id-1], &update_rearInfo, sizeof(update_rearInfo), 0);
         }
 

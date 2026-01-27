@@ -28,6 +28,7 @@
 #include "follower.h"
 #include "tpnet.h"
 #include "intruder.h"
+#include "matrix_clock.h"
 
 
 //TRUCK
@@ -46,7 +47,7 @@ EventQueue truck_EventQ;
 // SOCKET RELATED
 int udp_sock;
 int32_t tcp2Leader;
-
+MatrixClock follower_clock;
 
 int main(int argc, char* argv[]) {
 
@@ -59,6 +60,8 @@ int main(int argc, char* argv[]) {
     uint16_t leader_tcp_port = LEADER_PORT;
     const char* my_ip = LEADER_IP;
     uint16_t my_port = atoi(argv[1]);
+    
+    matrix_clock_init(&follower_clock, follower_idx); //matrix clock
 
     /* Seed */
     srand(time(NULL) ^ getpid());

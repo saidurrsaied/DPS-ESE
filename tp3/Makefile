@@ -6,7 +6,7 @@ CFLAGS = -Wall -Wextra -std=c99 -D_POSIX_C_SOURCE=200809L
 LDFLAGS = -lpthread
 
 # Source files for follower
-FOLLOWER_SRCS = follower.c event.c tpnet.c emergency.c intruder.c
+FOLLOWER_SRCS = follower.c event.c tpnet.c emergency.c intruder.c matrix_clock.c
 FOLLOWER_OBJS = $(FOLLOWER_SRCS:.c=.o)
 FOLLOWER_EXEC = follower
 
@@ -16,7 +16,7 @@ LEADER_OBJS = $(LEADER_SRCS:.c=.o)
 LEADER_EXEC = leader
 
 # Headers
-HEADERS = truckplatoon.h event.h follower.h tpnet.h intruder.h
+HEADERS = truckplatoon.h event.h follower.h tpnet.h intruder.h matrix_clock.h
 
 # Default target
 all: $(FOLLOWER_EXEC) $(LEADER_EXEC)

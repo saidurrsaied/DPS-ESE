@@ -15,6 +15,7 @@
 #include "follower.h"
 #include "intruder.h"
 #include "event.h"
+#include "matrix_clock.h"
 
 
 #define INTRUDER_PROBABILITY 10  // %
@@ -162,8 +163,11 @@ int toggle_intruder(void) {
 void enter_intruder_follow(IntruderInfo intruder) {
     follower.state = INTRUDER_FOLLOW;
     follower.speed = intruder.speed;  // slow down to intruder's speed
-    printf("[STATE] Follower entering INTRUDER_FOLLOW: speed=%d, length=%d\n",
-           intruder.speed, intruder.length);
+    printf("[STATE] Follower entering INTRUDER_FOLLOW: speed=%d, length=%d\n", intruder.speed, intruder.length);
+    
+    
+           
+           
 }
 
 //intruder exit alert
@@ -190,9 +194,18 @@ char getch(void) {
 
 // Helper: Notify leader about intruder
 void notify_leader_intruder(IntruderInfo intruder) {
+
+
+	matrix_clock_on_send(&follower_clock); //matrix clock
+	
+	
     FT_MESSAGE msg = {0};
     msg.type = MSG_FT_INTRUDER_REPORT;   // Already defined
     msg.payload.intruder = intruder;
+
+	/* matrix clock*/
+	memcpy(msg.matrix_clock, follower_clock.clock, sizeof(follower_clock.clock));
+	/**/
 
     ssize_t ret = send(tcp2Leader, &msg, sizeof(msg), 0);
     if (ret < 0) {
