@@ -17,17 +17,23 @@
 //FUNC: Propagate Emergency Brake 
 
 void propagate_emergency(void){
-    if (!has_rearTruck)
+
+    pthread_mutex_lock(&mutex_topology);
+    int local_has_rear = has_rearTruck;
+    NetInfo local_rear = rearTruck_Address;
+    pthread_mutex_unlock(&mutex_topology);
+    
+    if (!local_has_rear)
         return;
 
     struct sockaddr_in dst;
     memset(&dst, 0, sizeof(dst));
 
     dst.sin_family = AF_INET;
-    dst.sin_port   = htons(rearTruck_Address.udp_port);
+    dst.sin_port   = htons(local_rear.udp_port);
 
     if (inet_pton(AF_INET,
-                  rearTruck_Address.ip,
+                  local_rear.ip,
                   &dst.sin_addr) != 1) {
         perror("inet_pton failed in propagate_emergency");
         return;
@@ -35,13 +41,15 @@ void propagate_emergency(void){
 
     FT_MESSAGE emergency_warning = {.type=MSG_FT_EMERGENCY_BRAKE, 
                                     .payload.warning.emergency_Flag = 1, .payload.warning.resendFlag =0 }; 
-
+    
+    pthread_mutex_lock(&mutex_sockets);
     int32_t status = sendto(udp_sock,
                           &emergency_warning,
                           sizeof(emergency_warning),
                           0,
                           (struct sockaddr*)&dst,
                           sizeof(dst));
+    pthread_mutex_unlock(&mutex_sockets);
 
     if (status < 0) {
         perror("sendto EMERGENCY failed");
@@ -96,12 +104,18 @@ void start_emergency_timer(uint32_t duration_ms) {
 
 // FUNC: Entry Actions for emergency Brake 
 void enter_emergency(void) {
+    pthread_mutex_lock(&mutex_follower);
     follower.state = EMERGENCY_BRAKE;
     follower.speed = 0;
+    pthread_mutex_unlock(&mutex_follower);
+    
     propagate_emergency();
-    start_emergency_timer(5000);   
+    start_emergency_timer(5000);
 }
 
 void exit_emergency(void){
+    pthread_mutex_lock(&mutex_follower);
     follower.state = CRUISE; 
+    pthread_mutex_unlock(&mutex_follower);
+    printf("[EMERGENCY] Exit: Resuming cruise mode\n");
 }

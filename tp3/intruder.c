@@ -19,6 +19,7 @@
 
 #define INTRUDER_PROBABILITY 10  // %
 
+
 int intruder_detected(void) {
     return (rand() % 100) < INTRUDER_PROBABILITY;
 }
@@ -133,7 +134,9 @@ void enter_intruder_follow(IntruderInfo intruder) {
 
 //FUNC: Entry action while still in intruder state to match intruder speed 
 void update_intruder(IntruderInfo intruder) {
+    pthread_mutex_lock(&mutex_follower);
     follower.speed = intruder.speed;
+    pthread_mutex_unlock(&mutex_follower);
 }
 
 #define NOMINAL_FOLLOW_DISTANCE 10  // meters
@@ -160,15 +163,20 @@ int toggle_intruder(void) {
 
 //intruder alert
 void enter_intruder_follow(IntruderInfo intruder) {
+    pthread_mutex_lock(&mutex_follower);
     follower.state = INTRUDER_FOLLOW;
     follower.speed = intruder.speed;  // slow down to intruder's speed
+    pthread_mutex_unlock(&mutex_follower);
+    
     printf("[STATE] Follower entering INTRUDER_FOLLOW: speed=%d, length=%d\n",
            intruder.speed, intruder.length);
 }
 
 //intruder exit alert
 void exit_intruder_follow(void) {
+    pthread_mutex_lock(&mutex_follower);
     follower.state = CRUISE;
+    pthread_mutex_unlock(&mutex_follower);
     printf("[STATE] Intruder cleared → back to CRUISE\n");
 }
 
@@ -194,7 +202,10 @@ void notify_leader_intruder(IntruderInfo intruder) {
     msg.type = MSG_FT_INTRUDER_REPORT;   // Already defined
     msg.payload.intruder = intruder;
 
+    pthread_mutex_lock(&mutex_sockets);
     ssize_t ret = send(tcp2Leader, &msg, sizeof(msg), 0);
+    pthread_mutex_unlock(&mutex_sockets);
+    
     if (ret < 0) {
         perror("[INTRUDER] Failed to notify leader");
     } else {
@@ -236,3 +247,4 @@ void* keyboard_listener(void* arg) {
     }
     return NULL;
 }
+

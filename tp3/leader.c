@@ -17,33 +17,53 @@
 #include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <sys/select.h>
+#include <errno.h>
+#include <unistd.h>
+#include <termios.h>
 
 #include "truckplatoon.h"
 
+/* Leader truck state */
 int leader_socket_fd;
 int follower_fd_list[MAX_FOLLOWERS];
 NetInfo follower_Addresses[MAX_FOLLOWERS];
 int follower_count = 0;
 
+/* Leader intruder tracking */
+int leader_in_intruder_mode = 0;
+int32_t intruder_speed = 0;
+pthread_mutex_t mutex_intruder_state;
+
 pthread_mutex_t mutex_client_fd_list;
 pthread_t sender_tid;
 pthread_t acceptor_tid;
+pthread_t receiver_tid;  // New receiver thread for follower messages
+pthread_t input_tid;
 
 Truck leader;
 uint64_t cmd_id = 0;
 CommandQueue cmd_queue; 
+int pending_turn = 0;
+DIRECTION next_turn_dir;
 
 void* accept_handler(void* arg);
 void* send_handler(void* arg);
+void* follower_message_receiver(void* arg);
+void *input_handler(void *arg); //BW
 void leader_decide_next_state(Truck* t);
 void move_truck(Truck* t);
 void queue_commands(LeaderCommand* ldr_cmd);
+void handle_follower_intruder_report(int follower_id, IntruderInfo intruder);
+void handle_follower_position_report(int follower_id, FT_POSITION position);
+void broadcast_emergency_to_followers(void);
 
 int main(void) {
     srand(time(NULL));
     pthread_mutex_init(&mutex_client_fd_list, NULL);
+    pthread_mutex_init(&mutex_intruder_state, NULL);
 
-    leader = (Truck){0,0,1,NORTH,CRUISE};
+    leader = (Truck){.x = 0.0f, .y = 0.0f, .speed = 0.0f, .dir = NORTH, .state = STOPPED};
 
     leader_socket_fd = socket(AF_INET, SOCK_STREAM, 0);
 
@@ -77,25 +97,60 @@ int main(void) {
         perror("pthread_create sender");
         return 1;
     }
-
-    printf("Leader started\n");
-
-    while (1) {
-        leader_decide_next_state(&leader);
-        move_truck(&leader);
-
-        LeaderCommand ldr_cmd = {
-            .command_id = cmd_id++,
-            .leader = leader
-        };
-        
-        queue_commands(&ldr_cmd);
-
-        printf("Leader pos (%d,%d), sent command: %lu \n", leader.x, leader.y, cmd_id);
-        fflush(stdout);
-
-        sleep(LEADER_SLEEP);
+    if (pthread_create(&receiver_tid, NULL, follower_message_receiver, NULL) != 0) {
+        perror("pthread_create receiver");
+        return 1;
     }
+    if (pthread_create(&input_tid, NULL, input_handler, NULL) != 0) {
+    perror("pthread_create input");
+    return 1;
+    }
+
+     printf("Leader started. Controls: [w/s] Speed, [a/d] Turn, [space] Brake, [q] Quit\n");
+
+     struct timespec next_tick;
+    clock_gettime(CLOCK_MONOTONIC, &next_tick);
+
+
+
+
+  while (1) {
+    next_tick.tv_nsec += (long)(SIM_DT * 1e9);
+    if (next_tick.tv_nsec >= 1e9) {
+      next_tick.tv_sec += 1;
+      next_tick.tv_nsec -= 1e9;
+    }
+
+    pthread_mutex_lock(&mutex_client_fd_list);
+
+    LeaderCommand ldr_cmd = {.command_id = ++cmd_id, .is_turning_event = 0};
+
+    if (pending_turn) {
+      ldr_cmd.is_turning_event = 1;
+      ldr_cmd.turn_point_x = leader.x;
+      ldr_cmd.turn_point_y = leader.y;
+      ldr_cmd.turn_dir = next_turn_dir;
+
+      leader.dir = next_turn_dir;
+      pending_turn = 0;
+      printf("\n[TURN] Leader at (%.2f, %.2f) to %d\n", ldr_cmd.turn_point_x,
+             ldr_cmd.turn_point_y, next_turn_dir);
+    }
+
+    move_truck(&leader);
+    ldr_cmd.leader = leader;
+
+    queue_commands(&ldr_cmd);
+
+    printf("\rLeader: POS(%.1f,%.1f) SPD=%.1f DIR=%d STATE=%d    ", leader.x,
+           leader.y, leader.speed, leader.dir, leader.state);
+    fflush(stdout);
+
+    pthread_mutex_unlock(&mutex_client_fd_list);
+
+    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_tick, NULL);
+  }
+    
 }
 
 
@@ -114,6 +169,12 @@ void* accept_handler(void* arg) {
         follower_fd_list[id] = follower_fd;
         follower_Addresses[id] = reg_msg.selfAddress;
         follower_count++;
+
+        // Send assigned ID to follower
+        LD_MESSAGE idMsg = {0};
+        idMsg.type = MSG_LDR_ASSIGN_ID;
+        idMsg.payload.assigned_id = follower_count;
+        send(follower_fd, &idMsg, sizeof(idMsg), 0);
 
         // Send rear-truck info to the newly connected follower. 
         //The first follower has no rear truck.but it expects a message
@@ -139,8 +200,147 @@ void* accept_handler(void* arg) {
 }
 
 
-/*  Leader logic */
+/* Thread: Receive and process messages from followers */
+void* follower_message_receiver(void* arg) {
+    (void)arg;
+    FT_MESSAGE msg;
+    
+    printf("[RECEIVER] Follower message receiver thread started\n");
+
+    while (1) {
+        pthread_mutex_lock(&mutex_client_fd_list);
+        
+        // Poll all follower sockets for messages
+        for (int i = 0; i < follower_count; i++) {
+            int fd = follower_fd_list[i];
+            
+            // Use non-blocking recv to check for data
+            ssize_t recv_len = recv(fd, &msg, sizeof(msg), MSG_DONTWAIT);
+            
+            if (recv_len < 0) {
+                // No data available (EAGAIN/EWOULDBLOCK) - continue to next follower
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    continue;
+                }
+                // Socket error - skip this follower
+                perror("recv");
+                continue;
+            }
+            
+            if (recv_len == 0) {
+                // Connection closed by follower
+                printf("[RECEIVER] Follower %d disconnected\n", i);
+                close(fd);
+                // Note: Could implement proper cleanup here
+                continue;
+            }
+
+            // Message received - process based on type
+            pthread_mutex_unlock(&mutex_client_fd_list);
+            
+            switch (msg.type) {
+                case MSG_FT_INTRUDER_REPORT:
+                    printf("[RECEIVER] Intruder report from follower %d: speed=%d, length=%d\n",
+                           i, msg.payload.intruder.speed, msg.payload.intruder.length);
+                    handle_follower_intruder_report(i, msg.payload.intruder);
+                    break;
+
+                case MSG_FT_POSITION:
+                    printf("[RECEIVER] Position report from follower %d: (%f,%f)\n",
+                           i, msg.payload.position.x, msg.payload.position.y);
+                    handle_follower_position_report(i, msg.payload.position);
+                    break;
+
+                case MSG_FT_EMERGENCY_BRAKE:
+                    printf("[RECEIVER] Emergency brake from follower %d\n", i);
+                    broadcast_emergency_to_followers();
+                    break;
+
+                default:
+                    printf("[RECEIVER] Unknown message type %d from follower %d\n", 
+                           msg.type, i);
+                    break;
+            }
+            
+            pthread_mutex_lock(&mutex_client_fd_list);
+        }
+        
+        pthread_mutex_unlock(&mutex_client_fd_list);
+        
+        // Small sleep to prevent busy-wait using select timeout
+        struct timeval tv = {.tv_sec = 0, .tv_usec = 100000};  // 100ms
+        select(0, NULL, NULL, NULL, &tv);
+    }
+    
+    return NULL;
+}
+
+
+/* Handle intruder report from follower */
+void handle_follower_intruder_report(int follower_id, IntruderInfo intruder) {
+    // If intruder speed is 0, it's an intruder clear event
+    if (intruder.speed == 0) {
+        printf("[LEADER] Intruder cleared by follower %d\n", follower_id);
+        
+        pthread_mutex_lock(&mutex_intruder_state);
+        leader_in_intruder_mode = 0;
+        intruder_speed = 0;
+        pthread_mutex_unlock(&mutex_intruder_state);
+        
+        return;
+    }
+    
+    // Intruder detected - leader matches intruder speed
+    printf("[LEADER] Matching intruder speed: %d m/s\n", intruder.speed);
+    
+    pthread_mutex_lock(&mutex_intruder_state);
+    leader_in_intruder_mode = 1;
+    intruder_speed = intruder.speed;
+    pthread_mutex_unlock(&mutex_intruder_state);
+}
+
+
+/* Handle position report from follower (for distance monitoring) */
+void handle_follower_position_report(int follower_id, FT_POSITION position) {
+    // Placeholder for future distance-based control
+    printf("[LEADER] Follower %d position: x=%.1f, y=%.1f\n",
+           follower_id, position.x, position.y);
+}
+
+
+/* Broadcast emergency brake to all followers */
+void broadcast_emergency_to_followers(void) {
+    printf("[LEADER] Broadcasting emergency brake to all followers\n");
+    
+    LD_MESSAGE emergency_msg = {0};
+    emergency_msg.type = MSG_LDR_EMERGENCY_BRAKE;
+    
+    pthread_mutex_lock(&mutex_client_fd_list);
+    for (int i = 0; i < follower_count; i++) {
+        ssize_t sret = send(follower_fd_list[i], &emergency_msg, sizeof(emergency_msg), 0);
+        if (sret < 0) {
+            perror("send emergency to follower");
+        }
+    }
+    pthread_mutex_unlock(&mutex_client_fd_list);
+}
+
+
+/*  Leader logic 
 void leader_decide_next_state(Truck* t) {
+    // Check if in intruder mode
+    pthread_mutex_lock(&mutex_intruder_state);
+    if (leader_in_intruder_mode) {
+        // Match intruder speed while in intruder mode
+        t->state = CRUISE;
+        t->speed = intruder_speed;
+        pthread_mutex_unlock(&mutex_intruder_state);
+        printf("[LEADER] In intruder mode: speed=%d\n", t->speed);
+        return;
+    }
+    pthread_mutex_unlock(&mutex_intruder_state);
+    
+    // Normal leader decision logic
     int r = rand() % 100;
 
     if (r < 2) {
@@ -171,17 +371,8 @@ void leader_decide_next_state(Truck* t) {
 
     t->state = CRUISE;
 }
+*/
 
-void move_truck(Truck* t) {
-    for (int i = 0; i < t->speed; i++) {
-        switch (t->dir) {
-            case NORTH: t->y++; break;
-            case SOUTH: t->y--; break;
-            case EAST:  t->x++; break;
-            case WEST:  t->x--; break;
-        }
-    }
-}
 
 //Helper function for queuing commands 
 void queue_commands(LeaderCommand* ldr_cmd) {
@@ -232,3 +423,69 @@ void* send_handler(void* arg) {
         pthread_mutex_unlock(&mutex_client_fd_list);
     }
 }
+
+/* Keyboard Input Handler */
+void *input_handler(void *arg) {
+  (void)arg;
+  struct termios oldt, newt;
+  tcgetattr(STDIN_FILENO, &oldt);
+  newt = oldt;
+  newt.c_lflag &= ~(ICANON | ECHO);
+  tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+
+  while (1) {
+    char c = getchar();
+    pthread_mutex_lock(&mutex_client_fd_list);
+    if (c == 'w') {
+      leader.speed += 0.5f;
+      leader.state = CRUISE;
+    } else if (c == 's') {
+      leader.speed -= 0.5f;
+      leader.state = CRUISE;
+      if (leader.speed <= 0) {
+        leader.speed = 0;
+        leader.state = STOPPED;
+      }
+    } else if (c == 'a') {
+      next_turn_dir = (leader.dir + 3) % 4; // Left
+      pending_turn = 1;
+      leader.state = CRUISE;
+    } else if (c == 'd') {
+      next_turn_dir = (leader.dir + 1) % 4; // Right
+      pending_turn = 1;
+      leader.state = CRUISE;
+    }
+    // else if (c == ' ') {
+    //   leader.speed = 0;
+    //   leader.state = EMERGENCY_BRAKE;
+    // }
+    else if (c == 'q') {
+      tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+      exit(0);
+    }
+    pthread_mutex_unlock(&mutex_client_fd_list);
+  }
+  return NULL;
+}
+
+/*Function: Move Truck*/
+void move_truck(Truck *t) {
+    float dx = 0, dy = 0;
+    switch (t->dir) {
+    case NORTH:
+    dy = t->speed * SIM_DT;
+    break;
+    case SOUTH:
+    dy = -t->speed * SIM_DT;
+    break;
+    case EAST:
+    dx = t->speed * SIM_DT;
+    break;
+    case WEST:
+    dx = -t->speed * SIM_DT;
+    break;
+    }
+    t->x += dx;
+    t->y += dy;
+}
+

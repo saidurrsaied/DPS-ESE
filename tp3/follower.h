@@ -18,6 +18,10 @@ extern int8_t simulation_running;
 /* Thread IDs */
 extern pthread_t udp_tid, tcp_tid, sm_tid;
 
+extern pthread_mutex_t mutex_follower;
+extern pthread_mutex_t mutex_topology;  // FOR has_rearTruck, rearTruck_Address
+extern pthread_mutex_t mutex_sockets;   // FOR udp_sock, tcp2Leader
+
 /* Event Queue */
 extern EventQueue truck_EventQ;
 
@@ -42,6 +46,7 @@ void event_queue_init(EventQueue* queue);
 void propagate_emergency(void);
 void enter_emergency(void);
 void handle_timer(void);
+void exit_emergency(void); 
 
 /* Intruder Functions */
 int intruder_detected(void);
@@ -56,5 +61,6 @@ void enter_intruder_follow(IntruderInfo intruder);
 void exit_intruder_follow(void);
 void update_intruder(IntruderInfo intruder);
 void restore_nominal_distance(void);
+void adjust_distance_from_front(FT_POSITION front_pos);
 
 #endif

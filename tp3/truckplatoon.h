@@ -15,7 +15,9 @@
 #define LEADER_SLEEP 1
 #define MAX_FOLLOWERS 5
 #define CMD_QUEUE_SIZE 10
-
+#define SAFE_DISTANCE 15 
+#define SIM_DT 0.1f //BW
+#define TARGET_GAP 10.0f //BW
 /* Directions & States */
 typedef enum {
     NORTH,
@@ -28,7 +30,8 @@ typedef enum {
 typedef enum {
     MSG_LDR_CMD,
     MSG_LDR_UPDATE_REAR, 
-    MSG_LDR_EMERGENCY_BRAKE
+    MSG_LDR_EMERGENCY_BRAKE, 
+    MSG_LDR_ASSIGN_ID
 } Leader_Truck_MSG_Type;
 
 typedef enum {
@@ -46,17 +49,14 @@ typedef enum {
     CRUISE,
     EMERGENCY_BRAKE,
     STOPPED, 
-    INTRUDER_FOLLOW, 
-    TURNING, 
-    ACCELERATE,
-    DECELERATE
+    INTRUDER_FOLLOW
 } TRUCK_CONTROL_STATE;
 
 /* Truck struct */
 typedef struct {
-    int32_t x;
-    int32_t y;
-    int32_t speed;
+    float x;
+    float y;
+    float speed;
     DIRECTION dir;
     TRUCK_CONTROL_STATE state;
 } Truck;
@@ -71,6 +71,10 @@ typedef struct {
 typedef struct {
     uint64_t command_id;
     Truck leader;
+    int32_t is_turning_event; 
+    float turn_point_x; 
+    float turn_point_y; 
+    DIRECTION turn_dir; 
 } LeaderCommand;
 
 /* Registration message*/
@@ -104,13 +108,15 @@ typedef struct {
     union {
         LeaderCommand cmd; 
         RearInfoMsg rearInfo; 
+        int32_t assigned_id;
     } payload;       
 }LD_MESSAGE;
 
 /* Front Truck UDP Message Typedefs */
 typedef struct {
-    int32_t x; 
-    int32_t y; 
+    float x; 
+    float y; 
+    float speed;
 }FT_POSITION; 
 
 typedef struct {
