@@ -90,7 +90,7 @@ int turn_queue_push(TurnQueue *q, float x, float y, DIRECTION dir);
  */
 int turning_check_and_update(TurnQueue *q, float x, float y,
                              DIRECTION current_dir, DIRECTION *out_dir,
-                             float *out_x, float *out_y);
+                             float *out_x, float *out_y, int follower_idx);
 
 
 

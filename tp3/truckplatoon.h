@@ -7,6 +7,7 @@
 
 #include <stdint.h>
 #include <pthread.h>
+#include "matrix_clock.h"
 
 /* Networking*/
 #define LEADER_IP   "127.0.0.1"
@@ -80,6 +81,7 @@ typedef struct {
 /* Registration message*/
 typedef struct {
     NetInfo selfAddress;
+    MatrixClock matrix_clock;
 } FollowerRegisterMsg;
 
 /* Topology message */
@@ -109,7 +111,8 @@ typedef struct {
         LeaderCommand cmd; 
         RearInfoMsg rearInfo; 
         int32_t assigned_id;
-    } payload;       
+    } payload; 
+    MatrixClock matrix_clock;      
 }LD_MESSAGE;
 
 /* Front Truck UDP Message Typedefs */
@@ -131,6 +134,7 @@ typedef struct {
         FT_EMERGENCY warning; 
         IntruderInfo intruder; 
     }payload; 
+    MatrixClock matrix_clock;
 }FT_MESSAGE; 
 
 #endif

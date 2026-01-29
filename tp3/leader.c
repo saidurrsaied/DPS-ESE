@@ -1,11 +1,5 @@
 //leader.c
 
-//TODO: 
-/*
-    1. Add follower intruder notification receive capability and handle logic 
-           **Details: If the follower send an intruder warning to the leader, the leader shall cruise at the speed of the 
-            intruder (sent by follower in the intruder notification ). The leader shall exit upon intruder timeout/ clear event. 
-*/
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -23,6 +17,7 @@
 #include <termios.h>
 
 #include "truckplatoon.h"
+#include "matrix_clock.h"
 
 /* Leader truck state */
 int leader_socket_fd;
@@ -47,6 +42,8 @@ CommandQueue cmd_queue;
 int pending_turn = 0;
 DIRECTION next_turn_dir;
 
+MatrixClock leader_clock; //matrix clock declaration
+
 void* accept_handler(void* arg);
 void* send_handler(void* arg);
 void* follower_message_receiver(void* arg);
@@ -66,6 +63,8 @@ int main(void) {
     leader = (Truck){.x = 0.0f, .y = 0.0f, .speed = 0.0f, .dir = NORTH, .state = STOPPED};
 
     leader_socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+    
+    mc_init(&leader_clock); // matrix clock
 
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
@@ -163,6 +162,11 @@ void* accept_handler(void* arg) {
 
         FollowerRegisterMsg reg_msg;
         recv(follower_fd, &reg_msg, sizeof(reg_msg), 0);
+        
+        /* Matrix clock*/
+        mc_local_event(&leader_clock,0); // 0 = leader ID
+		mc_print(&leader_clock); 
+		/**/
 
         pthread_mutex_lock(&mutex_client_fd_list);
         int id = follower_count;
@@ -181,6 +185,12 @@ void* accept_handler(void* arg) {
         LD_MESSAGE initialMsg = {0};
         initialMsg.type = MSG_LDR_UPDATE_REAR;
         initialMsg.payload.rearInfo.has_rearTruck = 0; // First connection has no rear
+        
+        /* Matrix clock*/
+        mc_send_event(&leader_clock, 0); // leader sends a message
+        memcpy(initialMsg.matrix_clock.mc, leader_clock.mc, sizeof(leader_clock.mc));
+        /**/
+        
         send(follower_fd, &initialMsg, sizeof(initialMsg), 0);
 
         // If there is a previous follower, update it so its rear points to this new follower 
@@ -189,6 +199,15 @@ void* accept_handler(void* arg) {
             update_rearInfo.type = MSG_LDR_UPDATE_REAR;
             update_rearInfo.payload.rearInfo.rearTruck_Address = reg_msg.selfAddress;
             update_rearInfo.payload.rearInfo.has_rearTruck = 1; 
+            
+            /* Matrix clock*/
+        mc_send_event(&leader_clock, 0); // leader sends a message
+		memcpy(initialMsg.matrix_clock.mc, leader_clock.mc, sizeof(leader_clock.mc));
+        /**/
+        
+        mc_send_event(&leader_clock, 0);
+			memcpy(update_rearInfo.matrix_clock.mc, leader_clock.mc, sizeof(leader_clock.mc));
+            
             send(follower_fd_list[id-1], &update_rearInfo, sizeof(update_rearInfo), 0);
         }
 
@@ -415,6 +434,11 @@ void* send_handler(void* arg) {
 
         pthread_mutex_lock(&mutex_client_fd_list);
         for (int i = 0; i < follower_count; i++) {
+        
+        	// Matrix clock update before sending
+            mc_send_event(&leader_clock, 0);  // 0 = leader ID
+            memcpy(ldr_cmd_msg.matrix_clock.mc, leader_clock.mc, sizeof(leader_clock.mc));
+        
             ssize_t sret = send(follower_fd_list[i], &ldr_cmd_msg, sizeof(ldr_cmd_msg), 0);
             if (sret < 0) {
                 perror("send to follower");

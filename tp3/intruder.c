@@ -15,10 +15,13 @@
 #include "follower.h"
 #include "intruder.h"
 #include "event.h"
+#include "matrix_clock.h"
 
 
 #define INTRUDER_PROBABILITY 10  // %
 
+int follower_idx;
+MatrixClock follower_clock;
 
 int intruder_detected(void) {
     return (rand() % 100) < INTRUDER_PROBABILITY;
@@ -166,6 +169,7 @@ void enter_intruder_follow(IntruderInfo intruder) {
     pthread_mutex_lock(&mutex_follower);
     follower.state = INTRUDER_FOLLOW;
     follower.speed = intruder.speed;  // slow down to intruder's speed
+    mc_local_event(&follower_clock, follower_idx); //mc: local intruder follow
     pthread_mutex_unlock(&mutex_follower);
     
     printf("[STATE] Follower entering INTRUDER_FOLLOW: speed=%d, length=%d\n",
@@ -176,6 +180,7 @@ void enter_intruder_follow(IntruderInfo intruder) {
 void exit_intruder_follow(void) {
     pthread_mutex_lock(&mutex_follower);
     follower.state = CRUISE;
+    mc_local_event(&follower_clock, follower_idx); //mc: local intruder clear
     pthread_mutex_unlock(&mutex_follower);
     printf("[STATE] Intruder cleared → back to CRUISE\n");
 }
@@ -198,11 +203,16 @@ char getch(void) {
 
 // Helper: Notify leader about intruder
 void notify_leader_intruder(IntruderInfo intruder) {
+
+	mc_send_event(&follower_clock, follower_idx); //mc: send event
     FT_MESSAGE msg = {0};
     msg.type = MSG_FT_INTRUDER_REPORT;   // Already defined
     msg.payload.intruder = intruder;
 
     pthread_mutex_lock(&mutex_sockets);
+    int temp_clock[NUM_TRUCKS][NUM_TRUCKS]; //mc
+    memcpy(temp_clock, follower_clock.mc, sizeof(follower_clock.mc)); //mc
+    //memcpy(msg.matrix_clock, follower_clock.mc, sizeof(follower_clock.mc)); //mc
     ssize_t ret = send(tcp2Leader, &msg, sizeof(msg), 0);
     pthread_mutex_unlock(&mutex_sockets);
     

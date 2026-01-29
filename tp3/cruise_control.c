@@ -1,5 +1,9 @@
 #include "cruise_control.h"
 #include <math.h>
+#include "matrix_clock.h"
+
+int follower_idx;
+MatrixClock follower_clock;
 
 float calculate_gap(float x1, float y1, float x2, float y2) {
   return sqrtf(powf(x1 - x2, 2) + powf(y1 - y2, 2));
@@ -72,7 +76,7 @@ int turn_queue_push(TurnQueue *q, float x, float y, DIRECTION dir) {
 
 int turning_check_and_update(TurnQueue *q, float x, float y,
                              DIRECTION current_dir, DIRECTION *out_dir,
-                             float *out_x, float *out_y) {
+                             float *out_x, float *out_y, int follower_idx) {
   if (q->count == 0) {
     return 0;
   }
@@ -107,6 +111,8 @@ int turning_check_and_update(TurnQueue *q, float x, float y,
     *out_x = next_ev.x;
     *out_y = next_ev.y;
     *out_dir = next_ev.dir;
+    
+    mc_local_event(&follower_clock, follower_idx); //mc: update turn event in matrix clock
 
     // Pop from queue
     q->head = (q->head + 1) % TURN_QUEUE_MAX;

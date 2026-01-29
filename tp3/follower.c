@@ -1,17 +1,6 @@
 // follower.c
 
 
-//TODOs: 
-
-/*
-    1. Add mechanism to warn leader about intruder. Send intruder info so that the leader can maintain appropriate speed and consequently 
-        the whole platoon runs at the same speed (intruder's speed) 
-        **Detals: Define intruder warning message struct, message type and payload. Use it on both the leader and the follower.  
-                        
-                Message Type: MSG_FT_INTRUDER_REPORT
-
-*/
-
 #define _POSIX_C_SOURCE 200809L
 
 #include <stdio.h>
@@ -31,6 +20,7 @@
 #include "tpnet.h"
 #include "intruder.h"
 #include "cruise_control.h"
+#include "matrix_clock.h"
 
 
 
@@ -65,7 +55,6 @@ Truck front_ref;
 float front_speed = 0;
 float leader_base_speed = 0;
 
-
 // Prototypes bw
 void broadcast_status(void);
 void move_truck(Truck *t, float dt, TurnQueue *q);
@@ -73,6 +62,8 @@ static void simulation_step(void);
 static void handle_cruise_cmd(Event *evnt);
 static void handle_distance_update(Event *evnt);
 
+
+MatrixClock follower_clock;  // mc
 
 int main(int argc, char* argv[]) {
 
@@ -83,6 +74,8 @@ int main(int argc, char* argv[]) {
 
     const char* my_ip = LEADER_IP;
     uint16_t my_port = atoi(argv[1]);
+    
+    mc_init(&follower_clock); //matrix clock initialization
 
     /* Seed */
     srand(time(NULL) ^ getpid());
@@ -156,16 +149,16 @@ void* udp_listener(void* arg) {
         }
 
         switch (msg.type) {
-            case MSG_FT_EMERGENCY_BRAKE:
+            case MSG_FT_EMERGENCY_BRAKE:{
                 Event emergency_evt = {.type = EVT_EMERGENCY};
                 push_event(&truck_EventQ, &emergency_evt);
-                break;
+                break;}
 
-            case MSG_FT_POSITION:
+            case MSG_FT_POSITION:{
                 Event distance_evt = {.type = EVT_DISTANCE};
                 distance_evt.event_data.ft_pos = msg.payload.position;
                 push_event(&truck_EventQ, &distance_evt);
-                break;
+                break;}
                 
             case MSG_FT_INTRUDER_REPORT:
                 // Potential future use
@@ -205,10 +198,10 @@ void* tcp_listener(void* arg) {
                     printf("[TOPOLOGY] Rear truck updated\n");
                     break; 
 
-                case MSG_LDR_EMERGENCY_BRAKE: 
+                case MSG_LDR_EMERGENCY_BRAKE: {
                     Event emergency_evt = {.type = EVT_EMERGENCY};
                     push_event(&truck_EventQ, &emergency_evt);
-                    break;
+                    break;}
                     
                 case MSG_LDR_ASSIGN_ID:
                     follower_idx = msg.payload.assigned_id;
@@ -238,8 +231,6 @@ void* truck_state_machine(void* arg) {
                 pthread_mutex_lock(&mutex_follower);
                 handle_cruise_cmd(&evnt);
                 pthread_mutex_unlock(&mutex_follower);
-                //TODO: implement follower speed and position change logic 
-                // func: cruiseAsLeader (evnt.event_data.leader_cmd.leader)
                 break;
 
             case EVT_DISTANCE : 
@@ -274,13 +265,15 @@ void* truck_state_machine(void* arg) {
                     break;
                 case EVT_INTRUDER:
                     // if intruder is detected again during intruder state, what to do ?
-                    update_intruder(evnt.event_data.intruder);               
+                    update_intruder(evnt.event_data.intruder);      
+                    mc_local_event(&follower_clock, follower_idx); //mc: increment for local intruder follow         
                     break;
 
                 case EVT_INTRUDER_CLEAR:
                     exit_intruder_follow();
                     IntruderInfo intruder_clear = {0};
                     notify_leader_intruder(intruder_clear);
+                    mc_local_event(&follower_clock, follower_idx); //mc: increment for local intruder clear
                     break;
 
                 case EVT_EMERGENCY:
@@ -436,7 +429,7 @@ void move_truck(Truck *t, float dt, TurnQueue *q) {
   DIRECTION next_dir;
   float snapped_x, snapped_y;
   if (turning_check_and_update(q, t->x, t->y, t->dir, &next_dir, &snapped_x,
-                               &snapped_y)) {
+                               &snapped_y, follower_idx)) {
     t->x = snapped_x;
     t->y = snapped_y;
     t->dir = next_dir;
