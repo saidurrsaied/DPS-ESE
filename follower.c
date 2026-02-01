@@ -11,6 +11,7 @@
 #include <pthread.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include <netinet/in.h> //Rajdeep
 #include <math.h>
 #include <errno.h>
 
@@ -33,6 +34,8 @@ static const char* state_label(TRUCK_CONTROL_STATE state); //Rajdeep
 static void sleep_ms(int ms); //Rajdeep
 static void* leader_heartbeat_monitor(void* arg); //Rajdeep
 static void request_stop_event(void); //Rajdeep
+static int attempt_reconnect(void); //Rajdeep
+static int connect2Leader_silent(void); //Rajdeep
 
 
 
@@ -64,15 +67,15 @@ int udp_sock;
 int32_t tcp2Leader;
 
 // Heartbeat state //Rajdeep
-int is_leader_active = 0; //Rajdeep
 uint64_t last_heartbeat_ms = 0; //Rajdeep
 uint64_t last_reconnect_attempt_ms = 0; //Rajdeep
 int reconnect_attempts = 0; //Rajdeep
-int reconnect_gave_up = 0; //Rajdeep
 int stop_requested = 0; //Rajdeep
 int reconnect_notice_printed = 0; //Rajdeep
 int heartbeat_printed = 0; //Rajdeep
 time_t last_heartbeat_wall = 0; //Rajdeep
+char follower_self_ip[64] = {0}; //Rajdeep
+uint16_t follower_self_port = 0; //Rajdeep
 
 // Control Vars //bw
 int follower_idx = 0;
@@ -91,6 +94,7 @@ static void handle_distance_update(Event *evnt);
 MatrixClock follower_clock;  // mc
 
 int main(int argc, char* argv[]) {
+    //Rajdeep
 
     if (argc != 2) {
         printf("Usage: %s  <MY_UDP_PORT>\n", argv[0]);
@@ -99,6 +103,9 @@ int main(int argc, char* argv[]) {
 
     const char* my_ip = LEADER_IP;
     uint16_t my_port = atoi(argv[1]);
+    strncpy(follower_self_ip, my_ip, sizeof(follower_self_ip) - 1); //Rajdeep
+    follower_self_ip[sizeof(follower_self_ip) - 1] = '\0'; //Rajdeep
+    follower_self_port = my_port; //Rajdeep
     
     mc_init(&follower_clock); //matrix clock initialization
 
@@ -127,7 +134,6 @@ int main(int argc, char* argv[]) {
     last_heartbeat_ms = monotonic_ms(); //Rajdeep
     last_heartbeat_wall = time(NULL); //Rajdeep
     last_reconnect_attempt_ms = last_heartbeat_ms; //Rajdeep
-    is_leader_active = 1; //Rajdeep
 
     // 3. Thread Creations 
     
@@ -205,13 +211,46 @@ void* udp_listener(void* arg) {
 
 //FUNC: TCP Listener 
 void* tcp_listener(void* arg) {
+    //Rajdeep
     (void)arg; //Rajdeep
 
     LD_MESSAGE msg;
     while (1) {
+            int fd; //Rajdeep
+            pthread_mutex_lock(&mutex_sockets); //Rajdeep
+            fd = tcp2Leader; //Rajdeep
+            pthread_mutex_unlock(&mutex_sockets); //Rajdeep
+
+            if (fd < 0) { //Rajdeep
+                sleep_ms(50); //Rajdeep
+                continue; //Rajdeep
+            } //Rajdeep
+
             /* TCP tag will be shown in the consolidated status line */ //Rajdeep
-            if (recv(tcp2Leader, &msg, sizeof(msg), 0) <= 0)
-                break;
+            ssize_t recv_len = recv(fd, &msg, sizeof(msg), MSG_DONTWAIT); //Rajdeep
+            if (recv_len < 0) { //Rajdeep
+                if (errno == EAGAIN || errno == EWOULDBLOCK) { //Rajdeep
+                    sleep_ms(50); //Rajdeep
+                    continue; //Rajdeep
+                } //Rajdeep
+                pthread_mutex_lock(&mutex_sockets); //Rajdeep
+                if (tcp2Leader == fd) { //Rajdeep
+                    close(tcp2Leader); //Rajdeep
+                    tcp2Leader = -1; //Rajdeep
+                } //Rajdeep
+                pthread_mutex_unlock(&mutex_sockets); //Rajdeep
+                continue; //Rajdeep
+            } //Rajdeep
+
+            if (recv_len == 0) { //Rajdeep
+                pthread_mutex_lock(&mutex_sockets); //Rajdeep
+                if (tcp2Leader == fd) { //Rajdeep
+                    close(tcp2Leader); //Rajdeep
+                    tcp2Leader = -1; //Rajdeep
+                } //Rajdeep
+                pthread_mutex_unlock(&mutex_sockets); //Rajdeep
+                continue; //Rajdeep
+            } //Rajdeep
 
             switch (msg.type){
                 case MSG_LDR_CMD:
@@ -243,9 +282,7 @@ void* tcp_listener(void* arg) {
                     last_heartbeat_ms = monotonic_ms(); //Rajdeep
                     last_reconnect_attempt_ms = last_heartbeat_ms; //Rajdeep
                     last_heartbeat_wall = now_wall; //Rajdeep
-                    is_leader_active = 1; //Rajdeep
                     reconnect_attempts = 0; //Rajdeep
-                    reconnect_gave_up = 0; //Rajdeep
                     reconnect_notice_printed = 0; //Rajdeep
                     if (!heartbeat_printed) { //Rajdeep
                         heartbeat_printed = 1; //Rajdeep
@@ -274,18 +311,21 @@ void* tcp_listener(void* arg) {
 
 
 static uint64_t monotonic_ms(void) { //Rajdeep
+    //Rajdeep
     struct timespec ts; //Rajdeep
     clock_gettime(CLOCK_MONOTONIC, &ts); //Rajdeep
     return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000; //Rajdeep
 } //Rajdeep
 
 static void format_wall_time(time_t t, char *buf, size_t len) { //Rajdeep
+    //Rajdeep
     struct tm tm_local; //Rajdeep
     localtime_r(&t, &tm_local); //Rajdeep
     strftime(buf, len, "%Y-%m-%d %H:%M:%S", &tm_local); //Rajdeep
 } //Rajdeep
 
 static void sleep_ms(int ms) { //Rajdeep
+    //Rajdeep
     struct timespec ts; //Rajdeep
     ts.tv_sec = ms / 1000; //Rajdeep
     ts.tv_nsec = (long)(ms % 1000) * 1000000L; //Rajdeep
@@ -295,6 +335,7 @@ static void sleep_ms(int ms) { //Rajdeep
 } //Rajdeep
 
 static const char* state_label(TRUCK_CONTROL_STATE state) { //Rajdeep
+    //Rajdeep
     switch (state) { //Rajdeep
         case CRUISE: return "CRUISE"; //Rajdeep
         case EMERGENCY_BRAKE: return "EMERGENCY_BRAKE"; //Rajdeep
@@ -305,6 +346,7 @@ static const char* state_label(TRUCK_CONTROL_STATE state) { //Rajdeep
 } //Rajdeep
 
 static void request_stop_event(void) { //Rajdeep
+    //Rajdeep
     pthread_mutex_lock(&mutex_heartbeat); //Rajdeep
     if (stop_requested) { //Rajdeep
         pthread_mutex_unlock(&mutex_heartbeat); //Rajdeep
@@ -317,7 +359,51 @@ static void request_stop_event(void) { //Rajdeep
     push_event(&truck_EventQ, &stop_evt); //Rajdeep
 } //Rajdeep
 
+static int connect2Leader_silent(void) { //Rajdeep
+    //Rajdeep
+    int32_t leader_fd = socket(AF_INET, SOCK_STREAM, 0); //Rajdeep
+    if (leader_fd < 0) { //Rajdeep
+        return -1; //Rajdeep
+    } //Rajdeep
+
+    struct sockaddr_in leader_addr = { //Rajdeep
+        .sin_family = AF_INET, //Rajdeep
+        .sin_port = htons(LEADER_PORT) //Rajdeep
+    };
+    inet_pton(AF_INET, LEADER_IP, &leader_addr.sin_addr); //Rajdeep
+
+    if (connect(leader_fd, (struct sockaddr*)&leader_addr, sizeof(leader_addr)) < 0) { //Rajdeep
+        close(leader_fd); //Rajdeep
+        return -1; //Rajdeep
+    } //Rajdeep
+
+    return leader_fd; //Rajdeep
+} //Rajdeep
+
+static int attempt_reconnect(void) { //Rajdeep
+    //Rajdeep
+    int new_fd = connect2Leader_silent(); //Rajdeep
+    if (new_fd < 0) { //Rajdeep
+        return -1; //Rajdeep
+    } //Rajdeep
+
+    if (join_platoon(new_fd, follower_self_ip, follower_self_port) < 0) { //Rajdeep
+        close(new_fd); //Rajdeep
+        return -1; //Rajdeep
+    } //Rajdeep
+
+    pthread_mutex_lock(&mutex_sockets); //Rajdeep
+    if (tcp2Leader >= 0) { //Rajdeep
+        close(tcp2Leader); //Rajdeep
+    } //Rajdeep
+    tcp2Leader = new_fd; //Rajdeep
+    pthread_mutex_unlock(&mutex_sockets); //Rajdeep
+
+    return 0; //Rajdeep
+} //Rajdeep
+
 static void* leader_heartbeat_monitor(void* arg) { //Rajdeep
+    //Rajdeep
     (void)arg; //Rajdeep
 
     while (1) { //Rajdeep
@@ -328,7 +414,6 @@ static void* leader_heartbeat_monitor(void* arg) { //Rajdeep
         uint64_t last_hb = last_heartbeat_ms; //Rajdeep
         uint64_t last_attempt = last_reconnect_attempt_ms; //Rajdeep
         int attempts = reconnect_attempts; //Rajdeep
-        int gave_up = reconnect_gave_up; //Rajdeep
         int notice_printed = reconnect_notice_printed; //Rajdeep
         time_t last_wall = last_heartbeat_wall; //Rajdeep
         pthread_mutex_unlock(&mutex_heartbeat); //Rajdeep
@@ -341,7 +426,7 @@ static void* leader_heartbeat_monitor(void* arg) { //Rajdeep
             continue; //Rajdeep
         } //Rajdeep
 
-        if (gave_up) { //Rajdeep
+        if (attempts >= HEARTBEAT_MAX_ATTEMPTS) { //Rajdeep
             continue; //Rajdeep
         } //Rajdeep
 
@@ -352,20 +437,26 @@ static void* leader_heartbeat_monitor(void* arg) { //Rajdeep
                 printf("leader last heartbeat time - %s\n", ts); //Rajdeep
                 printf("trying to reconnect with leader\n"); //Rajdeep
             } //Rajdeep
+            int reconnect_result = attempt_reconnect(); //Rajdeep
 
             pthread_mutex_lock(&mutex_heartbeat); //Rajdeep
-            reconnect_attempts++; //Rajdeep
-            attempts = reconnect_attempts; //Rajdeep
             last_reconnect_attempt_ms = now; //Rajdeep
-            is_leader_active = 0; //Rajdeep
-            reconnect_notice_printed = 1; //Rajdeep
-            heartbeat_printed = 0; //Rajdeep
-            if (reconnect_attempts >= HEARTBEAT_MAX_ATTEMPTS) { //Rajdeep
-                reconnect_gave_up = 1; //Rajdeep
+            if (reconnect_result == 0) { //Rajdeep
+                reconnect_attempts = 0; //Rajdeep
+                attempts = 0; //Rajdeep
+                reconnect_notice_printed = 0; //Rajdeep
+                last_heartbeat_ms = now; //Rajdeep
+                last_heartbeat_wall = time(NULL); //Rajdeep
+                heartbeat_printed = 0; //Rajdeep
+            } else { //Rajdeep
+                reconnect_attempts++; //Rajdeep
+                attempts = reconnect_attempts; //Rajdeep
+                reconnect_notice_printed = 1; //Rajdeep
+                heartbeat_printed = 0; //Rajdeep
             } //Rajdeep
             pthread_mutex_unlock(&mutex_heartbeat); //Rajdeep
 
-            if (attempts >= HEARTBEAT_MAX_ATTEMPTS) { //Rajdeep
+            if (reconnect_result != 0 && attempts >= HEARTBEAT_MAX_ATTEMPTS) { //Rajdeep
                 printf("Leader is disconnected.\n"); //Rajdeep
                 pthread_mutex_lock(&mutex_sockets); //Rajdeep
                 if (tcp2Leader >= 0) { //Rajdeep
@@ -384,6 +475,7 @@ static void* leader_heartbeat_monitor(void* arg) { //Rajdeep
 
 //FUNC: TRUCK State Machine Thread function
 void* truck_state_machine(void* arg) {
+    //Rajdeep
     (void)arg; //Rajdeep
     while (1) {
         Event evnt = pop_event(&truck_EventQ);
@@ -544,15 +636,19 @@ void adjust_distance_from_front(FT_POSITION front_pos) {
 
 // FUNC: Shared simulation step for event-driven updates //Rajdeep
 static void simulation_step(void) { //Rajdeep
+    //Rajdeep
   // 1. Move & Turn, UDP Status updates //Rajdeep
   move_truck(&follower, SIM_DT, &follower_turns); //Rajdeep
   broadcast_status(); //Rajdeep
 
   // 2. Print status line only when leader is active (avoid spam on disconnect) //Rajdeep
   pthread_mutex_lock(&mutex_heartbeat); //Rajdeep
-  int leader_active = is_leader_active; //Rajdeep
-  int reconnecting = reconnect_notice_printed || reconnect_gave_up; //Rajdeep
+  int attempts = reconnect_attempts; //Rajdeep
+  int notice_printed = reconnect_notice_printed; //Rajdeep
   pthread_mutex_unlock(&mutex_heartbeat); //Rajdeep
+
+  int leader_active = (attempts == 0 && !notice_printed); //Rajdeep
+  int reconnecting = (attempts > 0 || notice_printed); //Rajdeep
 
   pthread_mutex_lock(&mutex_follower); //Rajdeep
   TRUCK_CONTROL_STATE cur_state = follower.state; //Rajdeep
