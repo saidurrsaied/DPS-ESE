@@ -1,9 +1,7 @@
 #include "cruise_control.h"
 #include <math.h>
 #include "matrix_clock.h"
-
-int follower_idx;
-MatrixClock follower_clock;
+#include "follower.h"
 
 float calculate_gap(float x1, float y1, float x2, float y2) {
   return sqrtf(powf(x1 - x2, 2) + powf(y1 - y2, 2));

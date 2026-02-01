@@ -20,8 +20,7 @@
 
 #define INTRUDER_PROBABILITY 10  // %
 
-int follower_idx;
-MatrixClock follower_clock;
+/* follower_idx and follower_clock are defined in follower.c (extern in follower.h) */
 
 int intruder_detected(void) {
     return (rand() % 100) < INTRUDER_PROBABILITY;

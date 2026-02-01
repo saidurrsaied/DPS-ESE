@@ -29,6 +29,9 @@ extern EventQueue truck_EventQ;
 extern int udp_sock;
 extern int32_t tcp2Leader;
 
+#include "matrix_clock.h"
+extern int follower_idx;
+extern MatrixClock follower_clock;
 
 
 /* Thread Functions */
