@@ -1,5 +1,6 @@
 //leader.c
 
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <stdio.h>
@@ -61,6 +62,7 @@ void handle_follower_position_report(int follower_id, FT_POSITION position);
 void broadcast_emergency_to_followers(void);
 
 int main(void) {
+    //Rajdeep
     srand(time(NULL));
     pthread_mutex_init(&mutex_client_fd_list, NULL);
     pthread_mutex_init(&mutex_intruder_state, NULL);
@@ -163,6 +165,7 @@ int main(void) {
 
 
 void* accept_handler(void* arg) {
+    //Rajdeep
     (void)arg; //Rajdeep
 
     while (1) {
@@ -355,6 +358,7 @@ void broadcast_emergency_to_followers(void) {
 
 /* Heartbeat sender thread (TCP) */ //Rajdeep
 void* leader_heartbeat_sender(void* arg) { //Rajdeep
+    //Rajdeep
     (void)arg;
 
     LD_MESSAGE hb_msg = {0}; //Rajdeep
@@ -381,6 +385,7 @@ void* leader_heartbeat_sender(void* arg) { //Rajdeep
 } //Rajdeep
 
 static void sleep_ms(int ms) { //Rajdeep
+    //Rajdeep
     struct timespec ts; //Rajdeep
     ts.tv_sec = ms / 1000; //Rajdeep
     ts.tv_nsec = (long)(ms % 1000) * 1000000L; //Rajdeep
