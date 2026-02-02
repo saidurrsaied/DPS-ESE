@@ -214,7 +214,7 @@ void* keyboard_listener(void* arg) {
         return NULL;
     }
     
-    printf("\n[KEYBOARD] Ready: \n\t 'i' : toggle intruder,\n\t 'e' emergency, \n\t 'q' quit \n");
+    printf("\n[KEYBOARD] Ready: \n\t [i] : toggle intruder,\n\t [e] emergency, \n\t [q] quit \n");
     fflush(stdout);
     
     /* 2. Setup poll() for event-driven input - blocks until data available */

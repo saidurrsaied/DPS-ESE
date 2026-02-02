@@ -35,6 +35,7 @@ int8_t simulation_running = 1;
 pthread_t tid;
 pthread_t udp_tid, tcp_tid, sm_tid;
 pthread_t intruder_tid; //meghana
+pthread_t watchdog_tid;
 EventQueue truck_EventQ;
 TurnQueue follower_turns; // bw
 
@@ -42,6 +43,14 @@ TurnQueue follower_turns; // bw
 pthread_mutex_t mutex_follower;
 pthread_mutex_t mutex_topology;
 pthread_mutex_t mutex_sockets;
+pthread_mutex_t mutex_leader_rx;
+
+static uint64_t monotonic_ms(void);
+static void follower_update_leader_rx_time(void);
+static void* leader_rx_watchdog(void* arg);
+
+static uint64_t last_leader_rx_ms = 0;
+static int leader_timeout_emitted = 0;
 
 // SOCKET RELATED
 int udp_sock = -1;
@@ -139,7 +148,7 @@ int main(int argc, char* argv[]) {
     srand(time(NULL) ^ getpid());
 
     // Initial position (placeholder, will be snapped by TCP listener)
-    follower = (Truck) {.x = 0.0f, .y = -10.0f, .speed = 0, .dir = NORTH, .state = CRUISE};
+    follower = (Truck) {.x = 0.0f, .y = -10.0f, .speed = 0, .dir = NORTH, .state = PLATOONING};
 
     //EVENT Queue
     event_queue_init(&truck_EventQ); 
@@ -158,6 +167,12 @@ int main(int argc, char* argv[]) {
     pthread_mutex_init(&mutex_follower, NULL);
     pthread_mutex_init(&mutex_topology, NULL);
     pthread_mutex_init(&mutex_sockets, NULL);
+    pthread_mutex_init(&mutex_leader_rx, NULL);
+
+    pthread_mutex_lock(&mutex_leader_rx);
+    last_leader_rx_ms = monotonic_ms();
+    leader_timeout_emitted = 0;
+    pthread_mutex_unlock(&mutex_leader_rx);
 
     // 3. Thread Creations 
     
@@ -165,6 +180,7 @@ int main(int argc, char* argv[]) {
     pthread_create(&tcp_tid, NULL, tcp_listener, NULL);
     pthread_create(&sm_tid, NULL, truck_state_machine, NULL);
     pthread_create(&intruder_tid, NULL, keyboard_listener, NULL);//meghana
+    pthread_create(&watchdog_tid, NULL, leader_rx_watchdog, NULL);
     printf("[INIT] Threads started: udp_listener, tcp_listener, state_machine, keyboard_listener\n");
    
 
@@ -197,24 +213,49 @@ int main(int argc, char* argv[]) {
         }
         
         // ===== PHYSICS-ONLY OPERATIONS (No event queue interaction) =====
-        // Move truck based on current speed (read atomically)
+        // Move truck based on current speed/state (shared with FSM)
+        pthread_mutex_lock(&mutex_follower);
+        if (follower.state == STOPPED) {
+            follower.speed = 0.0f;
+        }
         move_truck(&follower, FOLLOWER_PHYS_DT, &follower_turns);
+        pthread_mutex_unlock(&mutex_follower);
         
         // Send position to rear truck (non-blocking UDP)
         send_position_to_rear();
         
         // Print status (no event queue blocking), but decimated for readability
         if (FOLLOWER_PRINT_EVERY_N <= 1 || (phys_tick_count % (unsigned long)FOLLOWER_PRINT_EVERY_N) == 0) {
+            Truck follower_snapshot;
+            Truck front_snapshot;
+            MatrixClock mc_snapshot;
+            pthread_mutex_lock(&mutex_follower);
+            follower_snapshot = follower;
+            pthread_mutex_unlock(&mutex_follower);
+
+            front_snapshot = front_ref;
+            mc_snapshot = follower_clock;
+
             const char *state_str = "UNKNOWN";
-            switch (follower.state) {
+            switch (follower_snapshot.state) {
                 case CRUISE: state_str = "CRUISE"; break;
                 case INTRUDER_FOLLOW: state_str = "INTRUDER_FOLLOW"; break;
                 case EMERGENCY_BRAKE: state_str = "EMERGENCY_BRAKE"; break;
                 case STOPPED: state_str = "STOPPED"; break;
+                case PLATOONING: state_str = "PLATOONING"; break;
             }
-            double gap = calculate_gap(follower.x, follower.y, front_ref.x, front_ref.y);
-            printf("\r[STATE: %s] [POS: %.1f,%.1f] [SPD: %.1f] [GAP: %.1f]    ",
-                   state_str, (double)follower.x, (double)follower.y, (double)follower.speed, gap);
+            char dir_ch = '?';
+            switch (follower_snapshot.dir) {
+                case NORTH: dir_ch = 'N'; break;
+                case EAST:  dir_ch = 'E'; break;
+                case SOUTH: dir_ch = 'S'; break;
+                case WEST:  dir_ch = 'W'; break;
+            }
+
+            double gap = calculate_gap(follower_snapshot.x, follower_snapshot.y, front_snapshot.x, front_snapshot.y);
+            printf("\r[STATE: %s] [POS: %.1f,%.1f] [SPD: %.1f] [DIR: %c] [GAP: %.1f]  ",
+                   state_str, (double)follower_snapshot.x, (double)follower_snapshot.y, (double)follower_snapshot.speed, dir_ch, gap
+                   );
             fflush(stdout);
         }
         // ================================================================
@@ -228,7 +269,60 @@ int main(int argc, char* argv[]) {
     pthread_join(udp_tid, NULL);
     pthread_join(tcp_tid, NULL);
     pthread_join(sm_tid, NULL);
+    pthread_join(watchdog_tid, NULL);
     return 0;
+}
+
+static uint64_t monotonic_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+}
+
+static void follower_update_leader_rx_time(void) {
+    pthread_mutex_lock(&mutex_leader_rx);
+    last_leader_rx_ms = monotonic_ms();
+    leader_timeout_emitted = 0;
+    pthread_mutex_unlock(&mutex_leader_rx);
+}
+
+static void* leader_rx_watchdog(void* arg) {
+    (void)arg;
+
+    while (!follower_shutdown_requested) {
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = (long)LEADER_WATCHDOG_PERIOD_MS * 1000L * 1000L};
+        nanosleep(&ts, NULL);
+
+        if (follower_shutdown_requested) break;
+
+        pthread_mutex_lock(&mutex_follower);
+        TRUCK_CONTROL_STATE st = follower.state;
+        pthread_mutex_unlock(&mutex_follower);
+
+        /* Ignore timeouts while platooning/formation is not complete (leader may legitimately be quiet). */
+        if (st == PLATOONING) {
+            continue;
+        }
+
+        uint64_t last_ms;
+        int already_emitted;
+        pthread_mutex_lock(&mutex_leader_rx);
+        last_ms = last_leader_rx_ms;
+        already_emitted = leader_timeout_emitted;
+        pthread_mutex_unlock(&mutex_leader_rx);
+
+        uint64_t now = monotonic_ms();
+        if (!already_emitted && now > last_ms && (now - last_ms) > (uint64_t)LEADER_RX_TIMEOUT_MS) {
+            pthread_mutex_lock(&mutex_leader_rx);
+            leader_timeout_emitted = 1;
+            pthread_mutex_unlock(&mutex_leader_rx);
+
+            Event ev = {.type = EVT_LEADER_TIMEOUT};
+            push_event(&truck_EventQ, &ev);
+        }
+    }
+
+    return NULL;
 }
 
 
@@ -298,6 +392,9 @@ void* tcp_listener(void* arg) {
                 }
                 break;
             }
+
+            /* Any message from leader implies liveness */
+            follower_update_leader_rx_time();
 
             switch (msg.type){
                 case MSG_LDR_CMD:
@@ -376,6 +473,26 @@ void* truck_state_machine(void* arg) {
         }
 
         switch (follower.state) {
+
+        case PLATOONING:
+            switch (evnt.type) {
+            case EVT_CRUISE_CMD:
+                pthread_mutex_lock(&mutex_follower);
+                follower.state = CRUISE;
+                handle_cruise_cmd(&evnt);
+                pthread_mutex_unlock(&mutex_follower);
+                break;
+            case EVT_EMERGENCY:
+                enter_emergency();
+                break;
+            case EVT_LEADER_TIMEOUT:
+                /* Ignore: leader may be quiet during formation. */
+                break;
+            default:
+                break;
+            }
+            break;
+
         case CRUISE:
             switch (evnt.type) {
 
@@ -410,6 +527,14 @@ void* truck_state_machine(void* arg) {
 
             case EVT_EMERGENCY:
                 enter_emergency();
+                break;
+
+            case EVT_LEADER_TIMEOUT:
+                pthread_mutex_lock(&mutex_follower);
+                follower.speed = 0;
+                follower.state = STOPPED;
+                pthread_mutex_unlock(&mutex_follower);
+                printf("\n[WATCHDOG] Leader messages stale -> STOPPED\n");
                 break;
 
             case EVT_EMERGENCY_TIMER: 
@@ -468,6 +593,17 @@ void* truck_state_machine(void* arg) {
                     break;
                 case EVT_EMERGENCY_TIMER: 
                     break; 
+
+                case EVT_LEADER_TIMEOUT:
+                    pthread_mutex_lock(&mutex_follower);
+                    follower.speed = 0;
+                    follower.state = STOPPED;
+                    pthread_mutex_unlock(&mutex_follower);
+                    printf("\n[WATCHDOG] Leader messages stale (intruder) -> STOPPED\n");
+                    break;
+
+                default:
+                    break;
                 }
                 break;
 
@@ -491,10 +627,44 @@ void* truck_state_machine(void* arg) {
 
                 case EVT_EMERGENCY:
                     break; // remain in emergency and do nothing. wait for timeout 
+
+                case EVT_LEADER_TIMEOUT:
+                    break; // ignore; already in safe mode
+
+                default:
+                    break;
             }
             break;
-        case STOPPED: 
-            
+
+        case STOPPED:
+            switch (evnt.type) {
+            case EVT_CRUISE_CMD:
+                pthread_mutex_lock(&mutex_follower);
+                follower.state = CRUISE;
+                handle_cruise_cmd(&evnt);
+                pthread_mutex_unlock(&mutex_follower);
+                printf("\n[WATCHDOG] Leader messages resumed -> CRUISE\n");
+                break;
+            case EVT_DISTANCE:
+                /* Stay safely stopped on stale leader. We can still update our notion of the front
+                 * truck position for gap display, but MUST NOT run cruise control here.
+                 */
+                if (platoon_position > 1) {
+                    have_front_position = 1;
+                    front_ref.x = evnt.event_data.ft_pos.x;
+                    front_ref.y = evnt.event_data.ft_pos.y;
+                    front_speed = evnt.event_data.ft_pos.speed;
+                }
+                break;
+            case EVT_EMERGENCY:
+                enter_emergency();
+                break;
+            case EVT_LEADER_TIMEOUT:
+                break;
+            default:
+                break;
+            }
+            break;
         }
     }
     return NULL;
