@@ -22,6 +22,7 @@
 #include "intruder.h"
 #include "cruise_control.h"
 #include "matrix_clock.h"
+#include "rt_wcet.h"
 
 
 //TRUCK
@@ -87,6 +88,46 @@ static void handle_cruise_cmd(Event *evnt);
 static void handle_distance_update(Event *evnt);
 
 MatrixClock follower_clock;  // mc
+
+/* === WCET instrumentation (thread CPU time) === */
+static RtWcetStat wcet_follower_phys_iter = RT_WCET_STAT_INIT("F1 physics iter");
+static RtWcetStat wcet_follower_watchdog_iter = RT_WCET_STAT_INIT("F2 watchdog iter");
+static RtWcetStat wcet_follower_tcp_dispatch = RT_WCET_STAT_INIT("F3 TCP msg->event");
+static RtWcetStat wcet_follower_udp_dispatch = RT_WCET_STAT_INIT("F4 UDP msg->event");
+static RtWcetStat wcet_follower_fsm_event = RT_WCET_STAT_INIT("F5 FSM per-event");
+
+static RtWcetStat wcet_follower_evt_emergency = RT_WCET_STAT_INIT("F5 EVT_EMERGENCY");
+static RtWcetStat wcet_follower_evt_timeout = RT_WCET_STAT_INIT("F5 EVT_LEADER_TIMEOUT");
+static RtWcetStat wcet_follower_evt_cruise = RT_WCET_STAT_INIT("F5 EVT_CRUISE_CMD");
+static RtWcetStat wcet_follower_evt_distance = RT_WCET_STAT_INIT("F5 EVT_DISTANCE");
+static RtWcetStat wcet_follower_evt_intruder = RT_WCET_STAT_INIT("F5 EVT_INTRUDER");
+
+static RtWcetStat* follower_stat_for_event(EventType t) {
+    switch (t) {
+        case EVT_EMERGENCY: return &wcet_follower_evt_emergency;
+        case EVT_LEADER_TIMEOUT: return &wcet_follower_evt_timeout;
+        case EVT_CRUISE_CMD: return &wcet_follower_evt_cruise;
+        case EVT_DISTANCE: return &wcet_follower_evt_distance;
+        case EVT_INTRUDER: return &wcet_follower_evt_intruder;
+        default: return NULL;
+    }
+}
+
+static void follower_wcet_print_summary(void) {
+    const RtWcetStat stats[] = {
+        wcet_follower_phys_iter,
+        wcet_follower_watchdog_iter,
+        wcet_follower_tcp_dispatch,
+        wcet_follower_udp_dispatch,
+        wcet_follower_fsm_event,
+        wcet_follower_evt_emergency,
+        wcet_follower_evt_timeout,
+        wcet_follower_evt_cruise,
+        wcet_follower_evt_distance,
+        wcet_follower_evt_intruder,
+    };
+    rt_wcet_stats_print_table(stderr, "Follower", stats, sizeof(stats) / sizeof(stats[0]));
+}
 
 int follower_is_shutting_down(void) {
     return follower_shutdown_requested ? 1 : 0;
@@ -201,6 +242,7 @@ int main(int argc, char* argv[]) {
     // DECOUPLED PHYSICS TIMER: Runs independently of event processing
     // This ensures continuous motion even if event queue fills up
     while (simulation_running && !follower_shutdown_requested) {
+        uint64_t t0_iter = rt_wcet_thread_time_ns();
         if (follower_sig_received) {
             follower_request_shutdown("signal");
             break;
@@ -228,13 +270,11 @@ int main(int argc, char* argv[]) {
         if (FOLLOWER_PRINT_EVERY_N <= 1 || (phys_tick_count % (unsigned long)FOLLOWER_PRINT_EVERY_N) == 0) {
             Truck follower_snapshot;
             Truck front_snapshot;
-            MatrixClock mc_snapshot;
             pthread_mutex_lock(&mutex_follower);
             follower_snapshot = follower;
             pthread_mutex_unlock(&mutex_follower);
 
             front_snapshot = front_ref;
-            mc_snapshot = follower_clock;
 
             const char *state_str = "UNKNOWN";
             switch (follower_snapshot.state) {
@@ -261,6 +301,9 @@ int main(int argc, char* argv[]) {
         // ================================================================
         
         clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_tick, NULL);
+
+        uint64_t t1_iter = rt_wcet_thread_time_ns();
+        rt_wcet_stat_add(&wcet_follower_phys_iter, (t1_iter > t0_iter) ? (t1_iter - t0_iter) : 0);
     }
 
     follower_request_shutdown("main exit");
@@ -270,6 +313,8 @@ int main(int argc, char* argv[]) {
     pthread_join(tcp_tid, NULL);
     pthread_join(sm_tid, NULL);
     pthread_join(watchdog_tid, NULL);
+
+    follower_wcet_print_summary();
     return 0;
 }
 
@@ -292,6 +337,8 @@ static void* leader_rx_watchdog(void* arg) {
     while (!follower_shutdown_requested) {
         struct timespec ts = {.tv_sec = 0, .tv_nsec = (long)LEADER_WATCHDOG_PERIOD_MS * 1000L * 1000L};
         nanosleep(&ts, NULL);
+
+        uint64_t t0 = rt_wcet_thread_time_ns();
 
         if (follower_shutdown_requested) break;
 
@@ -320,6 +367,9 @@ static void* leader_rx_watchdog(void* arg) {
             Event ev = {.type = EVT_LEADER_TIMEOUT};
             push_event(&truck_EventQ, &ev);
         }
+
+        uint64_t t1 = rt_wcet_thread_time_ns();
+        rt_wcet_stat_add(&wcet_follower_watchdog_iter, (t1 > t0) ? (t1 - t0) : 0);
     }
 
     return NULL;
@@ -349,6 +399,8 @@ void* udp_listener(void* arg) {
             break;
         }
 
+        uint64_t t0 = rt_wcet_thread_time_ns();
+
         switch (msg.type) {
             case MSG_FT_EMERGENCY_BRAKE:{
                 Event emergency_evt = {.type = EVT_EMERGENCY};
@@ -368,6 +420,9 @@ void* udp_listener(void* arg) {
             default:
                 break;
         }
+
+        uint64_t t1 = rt_wcet_thread_time_ns();
+        rt_wcet_stat_add(&wcet_follower_udp_dispatch, (t1 > t0) ? (t1 - t0) : 0);
     }
     return NULL;
 }
@@ -392,6 +447,8 @@ void* tcp_listener(void* arg) {
                 }
                 break;
             }
+
+            uint64_t t0 = rt_wcet_thread_time_ns();
 
             /* Any message from leader implies liveness */
             follower_update_leader_rx_time();
@@ -457,6 +514,9 @@ void* tcp_listener(void* arg) {
                 default:
                     break;
             }
+
+            uint64_t t1 = rt_wcet_thread_time_ns();
+            rt_wcet_stat_add(&wcet_follower_tcp_dispatch, (t1 > t0) ? (t1 - t0) : 0);
         }
         return NULL;
     }
@@ -467,6 +527,8 @@ void* truck_state_machine(void* arg) {
     (void)arg;
     while (!follower_shutdown_requested) {
         Event evnt = pop_event(&truck_EventQ);
+
+        uint64_t t0 = rt_wcet_thread_time_ns();
 
         if (evnt.type == EVT_SHUTDOWN) {
             break;
@@ -666,6 +728,12 @@ void* truck_state_machine(void* arg) {
             }
             break;
         }
+
+        uint64_t t1 = rt_wcet_thread_time_ns();
+        uint64_t d = (t1 > t0) ? (t1 - t0) : 0;
+        rt_wcet_stat_add(&wcet_follower_fsm_event, d);
+        RtWcetStat* per_type = follower_stat_for_event(evnt.type);
+        if (per_type) rt_wcet_stat_add(per_type, d);
     }
     return NULL;
 }

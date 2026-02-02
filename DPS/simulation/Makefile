@@ -6,17 +6,17 @@ CFLAGS = -Wall -Wextra -std=c99 -D_POSIX_C_SOURCE=200809L
 LDFLAGS = -lpthread -lm
 
 # Source files for follower
-FOLLOWER_SRCS = follower.c event.c tpnet.c emergency.c intruder.c cruise_control.c matrix_clock.c
+FOLLOWER_SRCS = follower.c event.c tpnet.c emergency.c intruder.c cruise_control.c matrix_clock.c rt_wcet.c
 FOLLOWER_OBJS = $(FOLLOWER_SRCS:.c=.o)
 FOLLOWER_EXEC = follower
 
 # Source files for leader
-LEADER_SRCS = leader.c matrix_clock.c event.c
+LEADER_SRCS = leader.c matrix_clock.c event.c rt_wcet.c
 LEADER_OBJS = $(LEADER_SRCS:.c=.o)
 LEADER_EXEC = leader
 
 # Headers
-HEADERS = truckplatoon.h event.h follower.h tpnet.h intruder.h cruise_control.h matrix_clock.h
+HEADERS = truckplatoon.h event.h follower.h tpnet.h intruder.h cruise_control.h matrix_clock.h rt_wcet.h
 
 # Default target
 all: $(FOLLOWER_EXEC) $(LEADER_EXEC)
@@ -49,7 +49,7 @@ run-follower: $(FOLLOWER_EXEC)
 	./$(FOLLOWER_EXEC) 5001
 
 # Test: build leader integration test
-tests/test_leader: tests/test_leader_integration.o tests/leader_test.o event.o matrix_clock.o
+tests/test_leader: tests/test_leader_integration.o tests/leader_test.o event.o matrix_clock.o rt_wcet.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 # Build a test-friendly leader object that excludes the real main

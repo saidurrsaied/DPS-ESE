@@ -1,0 +1,19 @@
+# Python virtual environments
+.venv/
+.venv_*/
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.out
+
+# Built binaries (project targets)
+leader
+follower
+
+# Generated test binary (avoid committing rebuilds)
+tests/test_leader
+
+# Measurement outputs
+docs/schedulability/results/

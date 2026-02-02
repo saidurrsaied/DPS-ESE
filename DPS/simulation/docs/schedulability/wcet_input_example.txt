@@ -1,0 +1,18 @@
+=== WCET (thread CPU time) — Leader ===
+L1 tick-producer iter        count=1152  max=426.200us  avg=161.176us
+L2 FSM per-event             count=1182  max=1316.800us  avg=110.925us
+L5 accept loop iter          count=3  max=479.200us  avg=323.100us
+L4 rx msg->event             count=2  max=133.400us  avg=126.450us
+L3 send one cmd              count=1067  max=1081.600us  avg=466.462us
+
+=== WCET (thread CPU time) — Follower ===
+F1 physics iter              count=1140  max=631.500us  avg=271.184us
+F2 watchdog iter             count=2787  max=161.100us  avg=6.826us
+F3 TCP msg->event            count=1071  max=587.600us  avg=96.327us
+F4 UDP msg->event            count=1122  max=498.600us  avg=117.436us
+F5 FSM per-event             count=2196  max=807.100us  avg=9.183us
+F5 EVT_EMERGENCY             count=3  max=807.100us  avg=647.400us
+F5 EVT_LEADER_TIMEOUT        count=2  max=288.800us  avg=220.000us
+F5 EVT_CRUISE_CMD            count=1067  max=148.000us  avg=6.372us
+F5 EVT_DISTANCE              count=1119  max=142.300us  avg=8.847us
+F5 EVT_INTRUDER              count=1  max=387.500us  avg=387.500us

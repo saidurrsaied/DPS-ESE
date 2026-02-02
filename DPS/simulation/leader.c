@@ -22,6 +22,7 @@
 #include "event.h"
 #include "tpnet.h"
 #include "intruder.h"
+#include "rt_wcet.h"
 
 /* Leader truck state */
 int leader_socket_fd = -1;
@@ -79,6 +80,24 @@ void register_new_follower(int fd, FollowerRegisterMsg* reg_msg);
 void broadcast_to_followers(const void* msg_data, size_t msg_len);
 static void compact_followers_locked(void);
 static void send_spawn_to_follower(int fd, int assigned_id);
+
+/* === WCET instrumentation (thread CPU time) === */
+static RtWcetStat wcet_leader_tick_iter = RT_WCET_STAT_INIT("L1 tick-producer iter");
+static RtWcetStat wcet_leader_fsm_event = RT_WCET_STAT_INIT("L2 FSM per-event");
+static RtWcetStat wcet_leader_accept_iter = RT_WCET_STAT_INIT("L5 accept loop iter");
+static RtWcetStat wcet_leader_rx_dispatch = RT_WCET_STAT_INIT("L4 rx msg->event");
+static RtWcetStat wcet_leader_send_cmd = RT_WCET_STAT_INIT("L3 send one cmd");
+
+static void leader_wcet_print_summary(void) {
+    const RtWcetStat stats[] = {
+        wcet_leader_tick_iter,
+        wcet_leader_fsm_event,
+        wcet_leader_accept_iter,
+        wcet_leader_rx_dispatch,
+        wcet_leader_send_cmd,
+    };
+    rt_wcet_stats_print_table(stderr, "Leader", stats, sizeof(stats) / sizeof(stats[0]));
+}
 
 #ifndef TEST_LEADER
 int main(int argc, char** argv) {
@@ -179,6 +198,7 @@ int main(int argc, char** argv) {
 
 
     while (!leader_shutdown_requested) {
+    uint64_t t0 = rt_wcet_thread_time_ns();
                 if (leader_sig_received) {
                         leader_request_shutdown("signal");
                         break;
@@ -198,6 +218,9 @@ int main(int argc, char** argv) {
         leader_request_shutdown("signal");
         break;
     }
+
+        uint64_t t1 = rt_wcet_thread_time_ns();
+        rt_wcet_stat_add(&wcet_leader_tick_iter, (t1 > t0) ? (t1 - t0) : 0);
   }
 
   leader_request_shutdown("main exit");
@@ -209,6 +232,7 @@ int main(int argc, char** argv) {
   pthread_join(state_tid, NULL);
 
   leader_close_all_sockets();
+    leader_wcet_print_summary();
   return 0;
     
 }
@@ -267,6 +291,7 @@ void* accept_handler(void* arg) {
     (void)arg;
 
     while (!leader_shutdown_requested) {
+        uint64_t t0 = rt_wcet_thread_time_ns();
         if (leader_socket_fd < 0) break;
 
         fd_set rfds;
@@ -308,6 +333,9 @@ void* accept_handler(void* arg) {
 
         printf("Follower registered (socket=%d %s:%d)\n",
                follower_fd, reg_msg.selfAddress.ip, reg_msg.selfAddress.udp_port);
+
+        uint64_t t1 = rt_wcet_thread_time_ns();
+        rt_wcet_stat_add(&wcet_leader_accept_iter, (t1 > t0) ? (t1 - t0) : 0);
     }
     return NULL;
 }
@@ -566,6 +594,7 @@ void* follower_message_receiver(void* arg) {
             if (!FD_ISSET(fd, &readfds)) continue;
 
             FT_MESSAGE msg = {0};  /* FIXED: Initialize to zero to avoid garbage in padding */
+            uint64_t t0 = rt_wcet_thread_time_ns();
             ssize_t r = recv(fd, &msg, sizeof(msg), 0);
             if (r <= 0) {
                 if (r == 0) printf("\n[RECEIVER] Follower %d disconnected\n", followers[i].id);
@@ -599,6 +628,9 @@ void* follower_message_receiver(void* arg) {
             ev.event_data.follower_msg.follower_id = fid;
             ev.event_data.follower_msg.msg = msg;
             push_event(&leader_EventQ, &ev);
+
+            uint64_t t1 = rt_wcet_thread_time_ns();
+            rt_wcet_stat_add(&wcet_leader_rx_dispatch, (t1 > t0) ? (t1 - t0) : 0);
 
             pthread_mutex_lock(&mutex_followers);
         }
@@ -672,9 +704,12 @@ void* send_handler(void* arg) {
         pthread_mutex_unlock(&cmd_queue.mutex);
 
         /* Prepare matrix clock and broadcast to active followers */
+        uint64_t t0 = rt_wcet_thread_time_ns();
         mc_send_event(&leader_clock, 0);  // 0 = leader ID
         memcpy(ldr_cmd_msg.matrix_clock.mc, leader_clock.mc, sizeof(leader_clock.mc));
         broadcast_to_followers(&ldr_cmd_msg, sizeof(ldr_cmd_msg));
+        uint64_t t1 = rt_wcet_thread_time_ns();
+        rt_wcet_stat_add(&wcet_leader_send_cmd, (t1 > t0) ? (t1 - t0) : 0);
     }
 
     return NULL;
@@ -686,6 +721,7 @@ void* leader_state_machine(void* arg) {
     unsigned long tick_count = 0;
     while (!leader_shutdown_requested) {
         Event ev = pop_event(&leader_EventQ);
+        uint64_t t0 = rt_wcet_thread_time_ns();
         switch (ev.type) {
             case EVT_SHUTDOWN:
                 return NULL;
@@ -827,6 +863,8 @@ void* leader_state_machine(void* arg) {
                 //Unhandled event types relevant to follower truck
                 break;
         }
+        uint64_t t1 = rt_wcet_thread_time_ns();
+        rt_wcet_stat_add(&wcet_leader_fsm_event, (t1 > t0) ? (t1 - t0) : 0);
     }
     return NULL;
 }

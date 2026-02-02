@@ -1,0 +1,14 @@
+# Optional: tools for schedulability modeling
+#
+# On Ubuntu/WSL you may need:
+#   sudo apt update
+#   sudo apt install -y python3-pip python3-venv
+#
+# Then:
+#   python3 -m venv .venv
+#   source .venv/bin/activate
+#   pip install -r docs/schedulability/requirements.txt
+
+# pyCPA is not published on PyPI; install from upstream.
+# Pinned commit for reproducibility.
+git+https://github.com/IDA-TUBS/pycpa.git@824e7941030057ca7b2d2eccd269fa2d62719667
