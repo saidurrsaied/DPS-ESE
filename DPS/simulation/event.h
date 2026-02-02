@@ -11,7 +11,7 @@
 #include <unistd.h>
 
 #define MAX_EVENTS 32
-#define NUM_PRIORITIES 10 // Updated to include leader-specific and formation events
+#define NUM_PRIORITIES 11 // includes EVT_SHUTDOWN
 
 typedef enum {
     EVT_EMERGENCY  = 0,   // highest priority
@@ -23,7 +23,8 @@ typedef enum {
     EVT_TICK_UPDATE = 6,  // For physics simulation steps (leader)
     EVT_USER_INPUT  = 7,  // For keyboard commands (leader)
     EVT_FOLLOWER_MSG = 8, // Wraps incoming follower network messages (leader)
-    EVT_PLATOON_FORMED = 9 // Leader has minimum followers; finalize topology
+    EVT_PLATOON_FORMED = 9, // Leader has minimum followers; finalize topology
+    EVT_SHUTDOWN = 10       // Graceful termination request
 } EventType;
 
 /* Data for user input events */

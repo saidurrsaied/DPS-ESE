@@ -7,6 +7,7 @@
 #include <sys/socket.h>
 #include <sys/poll.h>
 #include <unistd.h>
+#include <errno.h>
 
 //Meghana Includes
 #include <termios.h>
@@ -222,12 +223,17 @@ void* keyboard_listener(void* arg) {
         .events = POLLIN  /* Wait for readable data */
     };
     
-    while (1) {
-        /* poll() blocks until stdin has data (no busy-waiting, no sleep) */
-        int ret = poll(&pfd, 1, -1);  /* -1 timeout = block indefinitely */
+    while (!follower_is_shutting_down()) {
+        /* Use a bounded timeout so we can observe shutdown requests promptly. */
+        int ret = poll(&pfd, 1, 200);
         
         if (ret < 0) {
+            if (errno == EINTR) {
+                if (follower_is_shutting_down()) break;
+                continue;
+            }
             perror("poll");
+            follower_request_shutdown("keyboard poll error");
             break;
         }
         
@@ -278,6 +284,7 @@ void* keyboard_listener(void* arg) {
             
             if (c == 'q' || c == 'Q') {
                 printf("\n[KEYBOARD] Quit command received\n");
+                follower_request_shutdown("user");
                 break;
             }
         }
