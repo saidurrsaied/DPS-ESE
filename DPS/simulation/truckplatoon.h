@@ -44,6 +44,10 @@
  */
 #define LEADER_RX_TIMEOUT_MS 2000
 #define LEADER_WATCHDOG_PERIOD_MS 100
+
+/* GPU intruder integration (file-based IPC from GPU service). */ //Rajdeep
+#define GPU_INTRUDER_FILE "intruder.txt" //Rajdeep
+#define GPU_INTRUDER_POLL_MS 200 //Rajdeep
 /* Directions & States */
 typedef enum {
     NORTH,
