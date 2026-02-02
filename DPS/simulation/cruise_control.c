@@ -17,13 +17,13 @@ float cruise_control_calculate_speed(float current_speed, float front_pos_x,
 
   /*
    * Projected Error:
-   * (static_gap - TARGET_GAP) - (front_speed * SIM_DT)
+    * (static_gap - TARGET_GAP) - (front_speed * CONTROL_DT)
    *
-   * This formula anticipates the leader's movement during the 0.1s tick.
+    * This formula anticipates the front truck's movement during the control tick.
    * By subtracting the expected movement, we shift the control target
    * to align perfectly with the terminal display.
    */
-  float projected_error = (static_gap - TARGET_GAP) - (front_speed * SIM_DT);
+    float projected_error = (static_gap - TARGET_GAP) - (front_speed * CONTROL_DT);
 
   /* TUNING
      Kp: 0.35 (Correction gain)
@@ -43,12 +43,57 @@ float cruise_control_calculate_speed(float current_speed, float front_pos_x,
   // 3. Safety Clamps
   if (new_speed < 0)
     new_speed = 0;
-  if (new_speed > base + 25.0f)
-    new_speed = base + 25.0f;
+  if (new_speed > base + MAX_SPEED_OVER_BASE)
+    new_speed = base + MAX_SPEED_OVER_BASE;
 
   return new_speed;
 }
 
+/**
+ * @brief Generalized speed calculation with dynamic target gap.
+ * Used for both normal cruise (TARGET_GAP=10) and intruder handling
+ * (TARGET_GAP + intruder_length).
+ */
+float cruise_control_calculate_speed_with_gap(float current_speed, float front_pos_x,
+                                              float front_pos_y, float front_speed,
+                                              float leader_base_speed, float my_x,
+                                              float my_y, float target_gap) {
+
+  // 1. Physical gap to the received front truck position
+  float static_gap = calculate_gap(my_x, my_y, front_pos_x, front_pos_y);
+
+  /*
+   * Projected Error (with dynamic target_gap):
+    * (static_gap - target_gap) - (front_speed * CONTROL_DT)
+   *
+   * When intruder is active: target_gap = TARGET_GAP (10.0) + intruder_length (50)
+   * This ensures follower maintains 60m gap instead of 10m
+   */
+    float projected_error = (static_gap - target_gap) - (front_speed * CONTROL_DT);
+
+  /* TUNING
+     Kp: 0.35 (Correction gain)
+     Kd: 0.70 (Damping gain - Matches speeds)
+  */
+  float Kp = 0.35f;
+  float Kd = 0.70f;
+
+  // 2. Control Law Structure
+  // New Speed = Leader Intent + Damping + Correction
+  float base = leader_base_speed;
+  float damping = (front_speed - current_speed) * Kd;
+  float correction = projected_error * Kp;
+
+  float new_speed = base + damping + correction;
+
+  // 3. Safety Clamps
+  if (new_speed < 0)
+    new_speed = 0;
+  if (new_speed > base + MAX_SPEED_OVER_BASE)
+    new_speed = base + MAX_SPEED_OVER_BASE;
+
+  return new_speed;
+}
 
 /*
 Functions for turning queue management

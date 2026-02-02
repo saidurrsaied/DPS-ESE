@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <sys/timerfd.h>
 #include <sys/socket.h>
+#include <sys/poll.h>
 #include <unistd.h>
 
 //Meghana Includes
@@ -43,19 +44,6 @@ typedef struct {
 } IntruderReportMsg;
 
 
-
-/*
-void notify_leader_intruder(IntruderInfo intruder) {
-    FT_MESSAGE msg = {0}; 
-    msg.type = MSG_FT_INTRUDER_REPORT; 
-    msg.payload.intruder = intruder; 
-
-    int32_t status = send( tcp2Leader, &msg, sizeof(msg), 0);
-    if (status < 0) {
-        perror("notify_leader_intruder()");
-    }
-}
-*/
 
 
 // intruder Time-out event generation 
@@ -96,7 +84,10 @@ void start_intruder_timer(uint32_t duration_ms) {
 }
 
 
-
+/*
+Function: Randomly decide to generate intruder event. 
+UNUSED currently as keyboard input is used instead 
+*/
 
 void maybe_intruder(void) {
     if (!intruder_detected())
@@ -116,20 +107,6 @@ void maybe_intruder(void) {
     push_event(&truck_EventQ, &e);
 }
 
-
-/*
-//Func: Entry action to intruder follow state
-void enter_intruder_follow(IntruderInfo intruder) {
-    follower.state = INTRUDER_FOLLOW;
-
-    follower.speed = intruder.speed;
-    //TODO: 
-    //Implement func: increase_follow_distance(intruder.length);
-
-    notify_leader_intruder(intruder);
-    start_intruder_timer(intruder.duration_ms);
-}
-*/
 
 
 
@@ -167,12 +144,18 @@ int toggle_intruder(void) {
 void enter_intruder_follow(IntruderInfo intruder) {
     pthread_mutex_lock(&mutex_follower);
     follower.state = INTRUDER_FOLLOW;
-    follower.speed = intruder.speed;  // slow down to intruder's speed
+    // Set target gap to maintain distance with intruder
+    current_target_gap = TARGET_GAP + (float)intruder.length;
+    current_intruder = intruder;
+    // Initialize speed to intruder speed only if currently stopped
+    if (follower.speed == 0) {
+        follower.speed = (float)intruder.speed;
+    }
     mc_local_event(&follower_clock, follower_idx); //mc: local intruder follow
     pthread_mutex_unlock(&mutex_follower);
     
-    printf("[STATE] Follower entering INTRUDER_FOLLOW: speed=%d, length=%d\n",
-           intruder.speed, intruder.length);
+    printf("[STATE] Follower entering INTRUDER_FOLLOW: speed=%d, length=%d, target_gap=%.1f\n",
+           intruder.speed, intruder.length, current_target_gap);
 }
 
 //intruder exit alert
@@ -183,22 +166,6 @@ void exit_intruder_follow(void) {
     pthread_mutex_unlock(&mutex_follower);
     printf("[STATE] Intruder cleared → back to CRUISE\n");
 }
-
-// read a single char from console without Enter key
-char getch(void) {
-    char buf = 0;
-    struct termios old = {0};
-    if (tcgetattr(0, &old) < 0) perror("tcgetattr()");
-    old.c_lflag &= ~ICANON;
-    old.c_lflag &= ~ECHO;
-    if (tcsetattr(0, TCSANOW, &old) < 0) perror("tcsetattr ICANON");
-    if (read(0, &buf, 1) < 0) perror("read()");
-    old.c_lflag |= ICANON;
-    old.c_lflag |= ECHO;
-    if (tcsetattr(0, TCSADRAIN, &old) < 0) perror("tcsetattr ~ICANON");
-    return buf;
-}
-
 
 // Helper: Notify leader about intruder
 void notify_leader_intruder(IntruderInfo intruder) {
@@ -224,36 +191,103 @@ void notify_leader_intruder(IntruderInfo intruder) {
 }
 
 // Thread function to create Intruder and Emergency Events based on keyboard inputs
+// OPTIMIZED: Event-driven I/O with poll() - zero polling overhead, immediate responsiveness
 void* keyboard_listener(void* arg) {
     (void)arg;
+    
+    /* 1. Setup Terminal Raw Mode ONCE at thread start */
+    struct termios oldt, newt;
+    if (tcgetattr(STDIN_FILENO, &oldt) < 0) {
+        perror("tcgetattr");
+        return NULL;
+    }
+    newt = oldt;
+    newt.c_lflag &= ~(ICANON | ECHO);      /* Disable canonical mode and echo */
+    newt.c_cc[VMIN] = 0;                   /* Non-blocking mode */
+    newt.c_cc[VTIME] = 0;
+    
+    /* Ensure stdout is line-buffered for immediate printing during raw mode */
+    fflush(stdout);
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &newt) < 0) {
+        perror("tcsetattr");
+        return NULL;
+    }
+    
+    printf("\n[KEYBOARD] Ready: \n\t 'i' : toggle intruder,\n\t 'e' emergency, \n\t 'q' quit \n");
+    fflush(stdout);
+    
+    /* 2. Setup poll() for event-driven input - blocks until data available */
+    struct pollfd pfd = {
+        .fd = STDIN_FILENO,
+        .events = POLLIN  /* Wait for readable data */
+    };
+    
     while (1) {
-        char c = getch();
-        if (c == 'i' || c == 'I') {
-            int state = toggle_intruder();  // toggle intruder flag
-
-            IntruderInfo intruder = {
-                .length = INTRUDER_LENGTH,
-                .speed  = INTRUDER_SPEED,
-                .duration_ms = 0  // can be 0 for now
-            };
-
-            Event evt;
-            if (state) {
-                printf("[INTRUDER] Intruder detected!\n");
-                evt.type = EVT_INTRUDER;
-            } else {
-                printf("[INTRUDER] Intruder cleared!\n");
-                evt.type = EVT_INTRUDER_CLEAR;
-            }
-            evt.event_data.intruder = intruder;
-            push_event(&truck_EventQ, &evt);
+        /* poll() blocks until stdin has data (no busy-waiting, no sleep) */
+        int ret = poll(&pfd, 1, -1);  /* -1 timeout = block indefinitely */
+        
+        if (ret < 0) {
+            perror("poll");
+            break;
         }
+        
+        if (ret == 0) {
+            /* Timeout (shouldn't happen with -1 timeout) */
+            continue;
+        }
+        
+        /* 3. Read available data when poll() indicates readiness */
+        if (pfd.revents & POLLIN) {
+            char c = 0;
+            ssize_t nread = read(STDIN_FILENO, &c, 1);
+            if (nread < 0) {
+                perror("read");
+                break;
+            }
+            if (nread == 0) {
+                /* EOF */
+                break;
+            }
+            
+            if (c == 'i' || c == 'I') {
+                int state = toggle_intruder();  /* toggle intruder flag */
 
-        if (c == 'e' || c == 'E') {
-            Event evt = {.type = EVT_EMERGENCY};
-            push_event(&truck_EventQ, &evt);
+                IntruderInfo intruder = {
+                    .length = INTRUDER_LENGTH,
+                    .speed  = INTRUDER_SPEED,
+                    .duration_ms = 0  /* toggle mode - no timeout */
+                };
+
+                Event evt;
+                if (state) {
+                    printf("\n[KEYBOARD] Intruder detected - press 'i' again to clear\n");
+                    evt.type = EVT_INTRUDER;
+                } else {
+                    printf("\n[KEYBOARD] Intruder cleared\n");
+                    evt.type = EVT_INTRUDER_CLEAR;
+                }
+                evt.event_data.intruder = intruder;
+                push_event(&truck_EventQ, &evt);
+            }
+
+            if (c == 'e' || c == 'E') {
+                printf("\n[KEYBOARD] Emergency event triggered\n");
+                Event evt = {.type = EVT_EMERGENCY};
+                push_event(&truck_EventQ, &evt);
+            }
+            
+            if (c == 'q' || c == 'Q') {
+                printf("\n[KEYBOARD] Quit command received\n");
+                break;
+            }
         }
     }
+    
+    /* 4. Restore Terminal ONCE at thread exit */
+    fflush(stdout);
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &oldt);
+    printf("[KEYBOARD] Terminal restored\n");
+    fflush(stdout);
     return NULL;
 }
 

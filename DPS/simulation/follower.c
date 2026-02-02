@@ -23,9 +23,6 @@
 #include "matrix_clock.h"
 
 
-
-
-
 //TRUCK
 Truck follower;
 NetInfo rearTruck_Address;
@@ -51,17 +48,28 @@ int32_t tcp2Leader;
 
 // Control Vars //bw
 int follower_idx = 0;
+int platoon_position = 0;  // Logical position in current platoon (1 = first after leader, 2 = second, etc.)
 Truck front_ref;
 float front_speed = 0;
 float leader_base_speed = 0;
 
+/* Join/Rejoin positioning:
+ * On initial join (or process restart), follower used to snap to y=-10*id, which becomes
+ * unrealistic when the leader has moved far. We now snap ONCE using the first received
+ * leader position (MSG_LDR_CMD) as reference.
+ */
+static int needs_spawn_snap = 0;
+static int have_front_position = 0;
+
+// Intruder Context for Distance Control
+IntruderInfo current_intruder = {0};  // Current active intruder
+float current_target_gap = TARGET_GAP; // Dynamic target gap (10.0 normal, 50+length during intruder)
+
 // Prototypes bw
-void broadcast_status(void);
+void send_position_to_rear(void);
 void move_truck(Truck *t, float dt, TurnQueue *q);
-static void simulation_step(void);
 static void handle_cruise_cmd(Event *evnt);
 static void handle_distance_update(Event *evnt);
-
 
 MatrixClock follower_clock;  // mc
 
@@ -80,7 +88,7 @@ int main(int argc, char* argv[]) {
     /* Seed */
     srand(time(NULL) ^ getpid());
 
-      // Initial position (placeholder, will be snapped by TCP listener)
+    // Initial position (placeholder, will be snapped by TCP listener)
     follower = (Truck) {.x = 0.0f, .y = -10.0f, .speed = 0, .dir = NORTH, .state = CRUISE};
 
     //EVENT Queue
@@ -89,10 +97,12 @@ int main(int argc, char* argv[]) {
 
     //1. Create TCP + UDP Sockets and Connect
     tcp2Leader = connect2Leader(); 
+    printf("[INIT] Connected to leader (tcp fd=%d)\n", tcp2Leader);
     udp_sock = createUDPServer(my_port); 
 
     // 2. Send Registration
     join_platoon(tcp2Leader, my_ip, my_port);
+    printf("[INIT] Registration sent to leader (udp_port=%d)\n", my_port);
 
     //Mutex Init
     pthread_mutex_init(&mutex_follower, NULL);
@@ -105,7 +115,7 @@ int main(int argc, char* argv[]) {
     pthread_create(&tcp_tid, NULL, tcp_listener, NULL);
     pthread_create(&sm_tid, NULL, truck_state_machine, NULL);
     pthread_create(&intruder_tid, NULL, keyboard_listener, NULL);//meghana
-    printf("Created Threads...\n");
+    printf("[INIT] Threads started: udp_listener, tcp_listener, state_machine, keyboard_listener\n");
    
 
 
@@ -120,13 +130,41 @@ int main(int argc, char* argv[]) {
     struct timespec next_tick;
     clock_gettime(CLOCK_MONOTONIC, &next_tick);
 
+    unsigned long phys_tick_count = 0;
+
+    // DECOUPLED PHYSICS TIMER: Runs independently of event processing
+    // This ensures continuous motion even if event queue fills up
     while (simulation_running) {
-        next_tick.tv_nsec += (long)(SIM_DT * 1e9);
+        phys_tick_count++;
+        next_tick.tv_nsec += (long)(FOLLOWER_PHYS_DT * 1e9);
         if (next_tick.tv_nsec >= 1e9) {
-        next_tick.tv_sec += 1;
-        next_tick.tv_nsec -= 1e9;
+            next_tick.tv_sec += 1;
+            next_tick.tv_nsec -= 1e9;
         }
-        simulation_step();
+        
+        // ===== PHYSICS-ONLY OPERATIONS (No event queue interaction) =====
+        // Move truck based on current speed (read atomically)
+        move_truck(&follower, FOLLOWER_PHYS_DT, &follower_turns);
+        
+        // Send position to rear truck (non-blocking UDP)
+        send_position_to_rear();
+        
+        // Print status (no event queue blocking), but decimated for readability
+        if (FOLLOWER_PRINT_EVERY_N <= 1 || (phys_tick_count % (unsigned long)FOLLOWER_PRINT_EVERY_N) == 0) {
+            const char *state_str = "UNKNOWN";
+            switch (follower.state) {
+                case CRUISE: state_str = "CRUISE"; break;
+                case INTRUDER_FOLLOW: state_str = "INTRUDER_FOLLOW"; break;
+                case EMERGENCY_BRAKE: state_str = "EMERGENCY_BRAKE"; break;
+                case STOPPED: state_str = "STOPPED"; break;
+            }
+            double gap = calculate_gap(follower.x, follower.y, front_ref.x, front_ref.y);
+            printf("\r[STATE: %s] [POS: %.1f,%.1f] [SPD: %.1f] [GAP: %.1f]    ",
+                   state_str, (double)follower.x, (double)follower.y, (double)follower.speed, gap);
+            fflush(stdout);
+        }
+        // ================================================================
+        
         clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_tick, NULL);
     }
     close(tcp2Leader);
@@ -177,7 +215,6 @@ void* tcp_listener(void* arg) {
 
     LD_MESSAGE msg;
     while (1) {
-            printf("[TCP]"); 
             if (recv(tcp2Leader, &msg, sizeof(msg), 0) <= 0)
                 break;
 
@@ -195,18 +232,49 @@ void* tcp_listener(void* arg) {
                     has_rearTruck = msg.payload.rearInfo.has_rearTruck;
                     if (has_rearTruck){ rearTruck_Address = msg.payload.rearInfo.rearTruck_Address;}
                     pthread_mutex_unlock(&mutex_topology);
-                    printf("[TOPOLOGY] Rear truck updated\n");
+                    printf("\n[TOPOLOGY] Rear updated: has_rear=%d rear_port=%d\n", has_rearTruck, rearTruck_Address.udp_port);
                     break; 
 
                 case MSG_LDR_EMERGENCY_BRAKE: {
                     Event emergency_evt = {.type = EVT_EMERGENCY};
                     push_event(&truck_EventQ, &emergency_evt);
                     break;}
+
+                case MSG_LDR_SPAWN:
+                    /* Leader-supplied spawn pose for realistic join near current platoon */
+                    pthread_mutex_lock(&mutex_follower);
+                    if (needs_spawn_snap) {
+                        follower.x = msg.payload.spawn.spawn_x;
+                        follower.y = msg.payload.spawn.spawn_y;
+                        follower.dir = msg.payload.spawn.spawn_dir;
+                        needs_spawn_snap = 0;
+                        have_front_position = 0;
+                        printf("\n[SPAWN] Leader spawn: (%.1f,%.1f) dir=%d pos=%d\n",
+                               follower.x, follower.y, follower.dir, msg.payload.spawn.assigned_id);
+                    }
+                    pthread_mutex_unlock(&mutex_follower);
+                    break;
                     
                 case MSG_LDR_ASSIGN_ID:
-                    follower_idx = msg.payload.assigned_id;
-                    follower.y = -10.0f * (float)follower_idx; // Snap to position
-                    printf("\n[ID] Assigned ID: %d (Starting Y: %.1f)\n", follower_idx, follower.y);
+                    /*
+                     * Leader may resend MSG_LDR_ASSIGN_ID during topology reformation.
+                     * We must NOT reset/snap our physical position on reassign, otherwise
+                     * trucks "jump" back to their initial start slots.
+                     */
+                    if (follower_idx == 0) {
+                        follower_idx = msg.payload.assigned_id;
+                        platoon_position = msg.payload.assigned_id;
+                           /* Defer physical spawn/snap until first cruise command arrives (we need leader position). */
+                           needs_spawn_snap = 1;
+                           have_front_position = 0;
+                           printf("\n[ID] Initial ID: %d (Platoon pos: %d)\n",
+                               follower_idx, platoon_position);
+                    } else {
+                        follower_idx = msg.payload.assigned_id;
+                        platoon_position = msg.payload.assigned_id;
+                        printf("\n[ID] Updated platoon position: %d \n",
+                               platoon_position);
+                    }
                     break;
                 default:
                     break;
@@ -219,12 +287,10 @@ void* tcp_listener(void* arg) {
 //FUNC: TRUCK State Machine Thread function
 void* truck_state_machine(void* arg) {
     while (1) {
-        printf("[FSM]"); 
         Event evnt = pop_event(&truck_EventQ);
 
         switch (follower.state) {
         case CRUISE:
-            printf("[STATE = CRUISE]"); 
             switch (evnt.type) {
 
             case EVT_CRUISE_CMD:
@@ -235,11 +301,25 @@ void* truck_state_machine(void* arg) {
 
             case EVT_DISTANCE : 
                 //adjust_distance_from_front(evnt.event_data.ft_pos);
+                pthread_mutex_lock(&mutex_follower);
                 handle_distance_update(&evnt);
+                pthread_mutex_unlock(&mutex_follower);
                 break;
             case EVT_INTRUDER:
+                // INLINE state change - consistent lock pattern
+                pthread_mutex_lock(&mutex_follower);
+                current_intruder = evnt.event_data.intruder;
+                current_target_gap = TARGET_GAP + (float)current_intruder.length;
+                follower.state = INTRUDER_FOLLOW;
+                if (follower.speed == 0) {
+                    follower.speed = (float)current_intruder.speed;
+                }
+                mc_local_event(&follower_clock, follower_idx);
+                pthread_mutex_unlock(&mutex_follower);
+                
                 notify_leader_intruder(evnt.event_data.intruder);
-                enter_intruder_follow(evnt.event_data.intruder);
+                printf("[STATE] Follower entering INTRUDER_FOLLOW: speed=%d, length=%d, target_gap=%.1f\n",
+                       current_intruder.speed, current_intruder.length, current_target_gap);
                 break;
 
             case EVT_EMERGENCY:
@@ -255,25 +335,46 @@ void* truck_state_machine(void* arg) {
             break;
 
         case INTRUDER_FOLLOW:
-            printf("[STATE = INTRUDER_FOLLOW]"); 
             switch (evnt.type) { 
                 case EVT_CRUISE_CMD: 
-                    printf("[INTRUDER] Ignoring cruise cmd while handling intruder\n");
+                    // FIX: PROCESS cruise commands with intruder-adjusted gap!
+                    pthread_mutex_lock(&mutex_follower);
+                    handle_cruise_cmd(&evnt);
+                    pthread_mutex_unlock(&mutex_follower);
                     break;
                 case EVT_DISTANCE:
-                    printf("[INTRUDER] Ignoring distance update while handling intruder\n");
+                    // FIX: PROCESS distance updates with intruder-adjusted gap!
+                    pthread_mutex_lock(&mutex_follower);
+                    handle_distance_update(&evnt);
+                    pthread_mutex_unlock(&mutex_follower);
                     break;
                 case EVT_INTRUDER:
-                    // if intruder is detected again during intruder state, what to do ?
-                    update_intruder(evnt.event_data.intruder);      
-                    mc_local_event(&follower_clock, follower_idx); //mc: increment for local intruder follow         
+                    // Update intruder info and recalculate target gap
+                    pthread_mutex_lock(&mutex_follower);
+                    current_intruder = evnt.event_data.intruder;
+                    // Target gap = base gap + intruder length
+                    current_target_gap = TARGET_GAP + (float)current_intruder.length;
+                    // IMPORTANT: Start at intruder speed, but DON'T LOCK IT
+                    // Let cruise control adjust speed to maintain the intruder gap
+                    if (follower.speed == 0) {
+                        follower.speed = (float)current_intruder.speed;  // Initialize only if stopped
+                    }
+                    pthread_mutex_unlock(&mutex_follower);
+                    mc_local_event(&follower_clock, follower_idx);
                     break;
 
                 case EVT_INTRUDER_CLEAR:
-                    exit_intruder_follow();
+                    // Clear intruder and restore normal gap target
+                    pthread_mutex_lock(&mutex_follower);
+                    current_intruder = (IntruderInfo){0};
+                    current_target_gap = TARGET_GAP;  // Restore normal gap
+                    // INLINE state change - avoid calling exit_intruder_follow() which re-locks!
+                    follower.state = CRUISE;
+                    mc_local_event(&follower_clock, follower_idx);
+                    pthread_mutex_unlock(&mutex_follower);
+                    
                     IntruderInfo intruder_clear = {0};
                     notify_leader_intruder(intruder_clear);
-                    mc_local_event(&follower_clock, follower_idx); //mc: increment for local intruder clear
                     break;
 
                 case EVT_EMERGENCY:
@@ -285,19 +386,18 @@ void* truck_state_machine(void* arg) {
                 break;
 
         case EMERGENCY_BRAKE:
-            printf("[STATE = EMERGENCY_BRAKE]"); 
             switch (evnt.type) {
                 case EVT_CRUISE_CMD: 
-                    printf("[EMERGENCY] Ignoring cruise cmd, in emergency mode\n");
+                    printf("\r[EMERGENCY] Ignoring cruise cmd, in emergency mode");
                     break;
                 case EVT_DISTANCE:
-                    printf("[EMERGENCY] Ignoring distance update, in emergency mode\n");
+                    printf("\r[EMERGENCY] Ignoring distance update, in emergency mode");
                     break;
                 case EVT_INTRUDER: 
-                    printf("[EMERGENCY] Ignoring intruder event, in emergency mode\n");
+                    printf("\r[EMERGENCY] Ignoring intruder event, in emergency mode");
                     break;
                 case EVT_INTRUDER_CLEAR: 
-                    printf("[EMERGENCY] Ignoring intruder clear, in emergency mode\n");
+                    printf("\r[EMERGENCY] Ignoring intruder clear, in emergency mode");
                     break;
                 case EVT_EMERGENCY_TIMER:
                         exit_emergency(); 
@@ -308,7 +408,6 @@ void* truck_state_machine(void* arg) {
             }
             break;
         case STOPPED: 
-            printf("[STATE = EMERGENCY_BRAKE]"); 
             
         }
     }
@@ -363,44 +462,73 @@ void adjust_distance_from_front(FT_POSITION front_pos) {
 }
 
 
-/*BW*/
-
-// FUNC: Shared simulation step for event-driven updates
-static void simulation_step(void) {
-  // 1. Move & Turn, UDP Status updates
-  move_truck(&follower, SIM_DT, &follower_turns);
-  broadcast_status();
-
-  // 2. Print status line
-  printf(
-      "\rF%d: POS(%.1f,%.1f) SPD=%.1f FRONT_Y=%.1f GAP=%.1f    ", follower_idx,
-      (double)follower.x, (double)follower.y, (double)follower.speed,
-      (double)front_ref.y,
-      (double)calculate_gap(follower.x, follower.y, front_ref.x, front_ref.y));
-  fflush(stdout);
-}
 
 // Helper to handle cruise command from leader
 static void handle_cruise_cmd(Event *evnt) {
   leader_base_speed = evnt->event_data.leader_cmd.leader.speed;
-  if (follower_idx == 1) {
-    front_ref = evnt->event_data.leader_cmd.leader;
-    front_speed = front_ref.speed;
-    follower.speed = cruise_control_calculate_speed(
-        follower.speed, front_ref.x, front_ref.y, front_speed,
-        leader_base_speed, follower.x, follower.y);
-  }
+
+    /*
+     * Spawn/snap on initial join using current leader position.
+     * Offset behind leader: platoon_position*TARGET_GAP + INTRUDER_LENGTH (join-safe margin).
+     */
+    if (needs_spawn_snap && platoon_position > 0) {
+        float offset = ((float)platoon_position * TARGET_GAP) + (float)INTRUDER_LENGTH;
+        Truck l = evnt->event_data.leader_cmd.leader;
+
+        follower.dir = l.dir;
+        switch (l.dir) {
+        case NORTH:
+            follower.x = l.x;
+            follower.y = l.y - offset;
+            break;
+        case SOUTH:
+            follower.x = l.x;
+            follower.y = l.y + offset;
+            break;
+        case EAST:
+            follower.x = l.x - offset;
+            follower.y = l.y;
+            break;
+        case WEST:
+            follower.x = l.x + offset;
+            follower.y = l.y;
+            break;
+        }
+
+        needs_spawn_snap = 0;
+        printf("\n[SPAWN] Snapped near leader at (%.1f,%.1f) pos=%d offset=%.1f\n",
+                     follower.x, follower.y, platoon_position, offset);
+    }
+
+    /*
+     * Control source selection:
+     * - platoon_position == 1: always follow leader directly.
+     * - platoon_position > 1: normally follow UDP front truck.
+     *   But right after join, UDP front updates may not have started yet, so temporarily
+     *   follow leader until we receive at least one EVT_DISTANCE.
+     */
+    if (platoon_position == 1 || (platoon_position > 1 && !have_front_position)) {
+        front_ref = evnt->event_data.leader_cmd.leader;
+        front_speed = front_ref.speed;
+        follower.speed = cruise_control_calculate_speed_with_gap(
+                follower.speed, front_ref.x, front_ref.y, front_speed,
+                leader_base_speed, follower.x, follower.y, current_target_gap);
+    }
 }
 
 // Helper to handle distance update from truck ahead
 static void handle_distance_update(Event *evnt) {
-  if (follower_idx > 1) {
+  // Use platoon_position (not follower_idx) to determine if we receive UDP updates
+  // platoon_position > 1 means we follow another follower truck
+  if (platoon_position > 1) {
+        have_front_position = 1;
     front_ref.x = evnt->event_data.ft_pos.x;
     front_ref.y = evnt->event_data.ft_pos.y;
     front_speed = evnt->event_data.ft_pos.speed;
-    follower.speed = cruise_control_calculate_speed(
+    // Use dynamic gap control (handles both normal and intruder cases)
+    follower.speed = cruise_control_calculate_speed_with_gap(
         follower.speed, front_ref.x, front_ref.y, front_speed,
-        leader_base_speed, follower.x, follower.y);
+        leader_base_speed, follower.x, follower.y, current_target_gap);
   }
 }
 
@@ -439,11 +567,16 @@ void move_truck(Truck *t, float dt, TurnQueue *q) {
 }
 
 // FUNC: Broadcast status to rear truck
-void broadcast_status(void) {
-  if (has_rearTruck) {
+void send_position_to_rear(void) {
+    pthread_mutex_lock(&mutex_topology);
+    int local_has_rear = has_rearTruck;
+    NetInfo local_rear = rearTruck_Address;
+    pthread_mutex_unlock(&mutex_topology);
+
+    if (local_has_rear) {
     struct sockaddr_in dst = {.sin_family = AF_INET,
-                              .sin_port = htons(rearTruck_Address.udp_port)};
-    inet_pton(AF_INET, rearTruck_Address.ip, &dst.sin_addr);
+                                                            .sin_port = htons(local_rear.udp_port)};
+        inet_pton(AF_INET, local_rear.ip, &dst.sin_addr);
 
     FT_MESSAGE msg = {.type = MSG_FT_POSITION,
                       .payload.position = {.x = follower.x,

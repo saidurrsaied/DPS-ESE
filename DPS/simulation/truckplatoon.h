@@ -17,7 +17,25 @@
 #define MAX_FOLLOWERS 5
 #define CMD_QUEUE_SIZE 10
 #define SAFE_DISTANCE 15 
-#define SIM_DT 0.1f //BW
+#define SIM_DT 0.1f // Legacy default; prefer *_DT constants below
+
+/* Simulation/Control Rates (seconds)
+ * - LEADER_TICK_DT: leader EVT_TICK_UPDATE generation
+ * - FOLLOWER_PHYS_DT: follower physics + UDP position broadcast cadence
+ * - CONTROL_DT: dt used inside cruise control prediction
+ */
+#define LEADER_TICK_DT 0.25f
+#define FOLLOWER_PHYS_DT 0.25f
+#define CONTROL_DT FOLLOWER_PHYS_DT
+
+/* Speed limits
+ * Current controller clamps follower speed to (leader_base_speed + MAX_SPEED_OVER_BASE).
+ */
+#define MAX_SPEED_OVER_BASE 25.0f
+
+/* Print decimation (print every N ticks). Set to 1 to print every tick. */
+#define LEADER_PRINT_EVERY_N 5
+#define FOLLOWER_PRINT_EVERY_N 5
 #define TARGET_GAP 10.0f //BW
 /* Directions & States */
 typedef enum {
@@ -32,7 +50,8 @@ typedef enum {
     MSG_LDR_CMD,
     MSG_LDR_UPDATE_REAR, 
     MSG_LDR_EMERGENCY_BRAKE, 
-    MSG_LDR_ASSIGN_ID
+    MSG_LDR_ASSIGN_ID,
+    MSG_LDR_SPAWN
 } Leader_Truck_MSG_Type;
 
 typedef enum {
@@ -90,6 +109,16 @@ typedef struct {
     NetInfo rearTruck_Address;
 } RearInfoMsg;
 
+/* Spawn message sent by leader to a newly joined follower (TCP).
+ * Allows realistic join near the current platoon position rather than a fixed start slot.
+ */
+typedef struct {
+    int32_t assigned_id; /* platoon position */
+    float spawn_x;
+    float spawn_y;
+    DIRECTION spawn_dir;
+} SpawnInfoMsg;
+
 
 typedef struct {
     int32_t speed;          // intruder speed
@@ -111,6 +140,7 @@ typedef struct {
         LeaderCommand cmd; 
         RearInfoMsg rearInfo; 
         int32_t assigned_id;
+        SpawnInfoMsg spawn;
     } payload; 
     MatrixClock matrix_clock;      
 }LD_MESSAGE;

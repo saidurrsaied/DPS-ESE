@@ -52,8 +52,23 @@ float cruise_control_calculate_speed(float current_speed, float front_pos_x,
                                      float leader_base_speed, float my_x,
                                      float my_y);
 
-
-
+/**
+ * @brief Calculate new speed with dynamic target gap (for intruder handling).
+ *
+ * @param current_speed Current speed of the follower
+ * @param front_pos_x X coordinate of the truck ahead
+ * @param front_pos_y Y coordinate of the truck ahead
+ * @param front_speed Current speed of the truck ahead
+ * @param leader_base_speed The speed the leader is commanding
+ * @param my_x My current X coordinate
+ * @param my_y My current Y coordinate
+ * @param target_gap Dynamic target gap (10.0 for normal, 50 + intruder_length for intruder)
+ * @return float New target speed
+ */
+float cruise_control_calculate_speed_with_gap(float current_speed, float front_pos_x,
+                                              float front_pos_y, float front_speed,
+                                              float leader_base_speed, float my_x,
+                                              float my_y, float target_gap);
 
 
 
