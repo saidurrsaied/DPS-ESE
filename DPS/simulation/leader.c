@@ -52,6 +52,11 @@ int pending_turn = 0;
 DIRECTION next_turn_dir;
 int leader_intruder_length = 0;
 
+/* If set, leader keeps connections but stops sending periodic cruise commands.
+ * Used to simulate network/leader stalls so follower watchdog can trigger.
+ */
+static int leader_stale_mode = 0;
+
 MatrixClock leader_clock; //matrix clock declaration
 
 static volatile sig_atomic_t leader_shutdown_requested = 0;
@@ -166,7 +171,7 @@ int main(int argc, char** argv) {
     return 1;
     }
 
-        printf("Leader started on TCP port %u. Controls: [w/s] Speed, [a/d] Turn, [space] Brake, [q] Quit\n",
+        printf("Leader started on TCP port %u.\nControls:\n\t[w/s] Speed\n\t [a/d] Turn \n\t [space] Brake \n\t [p] ToggleStale \n\t [q] Quit\n",
             (unsigned)leader_port);
 
     struct timespec next_tick;
@@ -697,6 +702,11 @@ void* leader_state_machine(void* arg) {
                     break;
                 }
 
+                if (leader_stale_mode) {
+                    /* Simulate leader/control plane stall: do not move and do not send commands. */
+                    break;
+                }
+
                 tick_count++;
 
                 LeaderCommand ldr_cmd = {.command_id = ++cmd_id, .is_turning_event = 0};
@@ -759,6 +769,13 @@ void* leader_state_machine(void* arg) {
                     leader.state = EMERGENCY_BRAKE;
                     /* Also broadcast emergency to followers */
                     broadcast_emergency_to_followers();
+                } else if (c == 'p' || c == 'P') {
+                    leader_stale_mode = !leader_stale_mode;
+                    if (leader_stale_mode) {
+                        printf("\n[LEADER] Stale mode ON: pausing cruise commands\n");
+                    } else {
+                        printf("\n[LEADER] Stale mode OFF: resuming cruise commands\n");
+                    }
                 } else if (c == 'q') {
                     leader_request_shutdown("user");
                 }

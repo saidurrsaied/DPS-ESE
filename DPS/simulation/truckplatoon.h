@@ -31,12 +31,19 @@
 /* Speed limits
  * Current controller clamps follower speed to (leader_base_speed + MAX_SPEED_OVER_BASE).
  */
-#define MAX_SPEED_OVER_BASE 25.0f
+#define MAX_SPEED_OVER_BASE 100.0f
 
 /* Print decimation (print every N ticks). Set to 1 to print every tick. */
 #define LEADER_PRINT_EVERY_N 5
 #define FOLLOWER_PRINT_EVERY_N 5
 #define TARGET_GAP 10.0f //BW
+
+/* Leader liveness / control freshness (follower-side watchdog)
+ * The follower records the time of the last leader TCP message (any type) and enters a safe
+ * state if messages go stale.
+ */
+#define LEADER_RX_TIMEOUT_MS 2000
+#define LEADER_WATCHDOG_PERIOD_MS 100
 /* Directions & States */
 typedef enum {
     NORTH,
@@ -69,7 +76,8 @@ typedef enum {
     CRUISE,
     EMERGENCY_BRAKE,
     STOPPED, 
-    INTRUDER_FOLLOW
+    INTRUDER_FOLLOW,
+    PLATOONING
 } TRUCK_CONTROL_STATE;
 
 /* Truck struct */
