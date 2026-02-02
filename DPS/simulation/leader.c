@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <termios.h>
+#include <signal.h>
 
 #include "truckplatoon.h"
 #include "matrix_clock.h"
@@ -23,7 +24,7 @@
 #include "intruder.h"
 
 /* Leader truck state */
-int leader_socket_fd;
+int leader_socket_fd = -1;
 
 
 FollowerSession followers[MAX_FOLLOWERS];
@@ -52,6 +53,13 @@ DIRECTION next_turn_dir;
 int leader_intruder_length = 0;
 
 MatrixClock leader_clock; //matrix clock declaration
+
+static volatile sig_atomic_t leader_shutdown_requested = 0;
+static volatile sig_atomic_t leader_sig_received = 0;
+
+static void leader_request_shutdown(const char* reason);
+static void leader_close_all_sockets(void);
+static void leader_on_signal(int signo);
 
 void* accept_handler(void* arg);
 void* send_handler(void* arg);
@@ -85,6 +93,14 @@ int main(int argc, char** argv) {
     }
 
     srand(time(NULL));
+
+    struct sigaction sa = {0};
+    sa.sa_handler = leader_on_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
     pthread_mutex_init(&mutex_client_fd_list, NULL);
     pthread_mutex_init(&mutex_leader_state, NULL);
 
@@ -157,9 +173,11 @@ int main(int argc, char** argv) {
     clock_gettime(CLOCK_MONOTONIC, &next_tick);
 
 
-
-
-  while (1) {
+    while (!leader_shutdown_requested) {
+                if (leader_sig_received) {
+                        leader_request_shutdown("signal");
+                        break;
+                }
         next_tick.tv_nsec += (long)(LEADER_TICK_DT * 1e9);
     if (next_tick.tv_nsec >= 1e9) {
       next_tick.tv_sec += 1;
@@ -170,19 +188,108 @@ int main(int argc, char** argv) {
     Event tick_ev = {.type = EVT_TICK_UPDATE};
     push_event(&leader_EventQ, &tick_ev);
 
-    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_tick, NULL);
+    int rc = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_tick, NULL);
+    if (rc == EINTR && leader_sig_received) {
+        leader_request_shutdown("signal");
+        break;
+    }
   }
+
+  leader_request_shutdown("main exit");
+
+  pthread_join(input_tid, NULL);
+  pthread_join(acceptor_tid, NULL);
+  pthread_join(receiver_tid, NULL);
+  pthread_join(sender_tid, NULL);
+  pthread_join(state_tid, NULL);
+
+  leader_close_all_sockets();
+  return 0;
     
 }
 #endif
+
+static void leader_on_signal(int signo) {
+    (void)signo;
+    leader_sig_received = 1;
+}
+
+static void leader_request_shutdown(const char* reason) {
+    if (leader_shutdown_requested) return;
+    leader_shutdown_requested = 1;
+
+    if (reason) {
+        fprintf(stderr, "\n[LEADER] Shutdown requested (%s)\n", reason);
+    }
+
+    /* Wake the FSM and sender thread */
+    Event ev = {.type = EVT_SHUTDOWN};
+    push_event(&leader_EventQ, &ev);
+
+    pthread_mutex_lock(&cmd_queue.mutex);
+    pthread_cond_broadcast(&cmd_queue.not_empty);
+    pthread_mutex_unlock(&cmd_queue.mutex);
+
+    /* Unblock accept() / recv() / select() by closing sockets */
+    leader_close_all_sockets();
+}
+
+static void leader_close_all_sockets(void) {
+    /* Close listening socket */
+    if (leader_socket_fd >= 0) {
+        shutdown(leader_socket_fd, SHUT_RDWR);
+        close(leader_socket_fd);
+        leader_socket_fd = -1;
+    }
+
+    /* Close all follower sockets */
+    pthread_mutex_lock(&mutex_followers);
+    for (int i = 0; i < MAX_FOLLOWERS; i++) {
+        if (!followers[i].active) continue;
+        int fd = followers[i].fd;
+        followers[i].active = 0;
+        followers[i].fd = -1;
+        if (fd >= 0) {
+            shutdown(fd, SHUT_RDWR);
+            close(fd);
+        }
+    }
+    pthread_mutex_unlock(&mutex_followers);
+}
 
 
 void* accept_handler(void* arg) {
     (void)arg;
 
-    while (1) {
+    while (!leader_shutdown_requested) {
+        if (leader_socket_fd < 0) break;
+
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(leader_socket_fd, &rfds);
+        struct timeval tv = {.tv_sec = 0, .tv_usec = 200000};
+
+        int ready = select(leader_socket_fd + 1, &rfds, NULL, NULL, &tv);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            if (leader_shutdown_requested) break;
+            perror("select accept");
+            continue;
+        }
+        if (ready == 0) continue;
+        if (!FD_ISSET(leader_socket_fd, &rfds)) continue;
+
         int follower_fd = accept(leader_socket_fd, NULL, NULL);
-        if (follower_fd < 0) continue;
+        if (follower_fd < 0) {
+            if (leader_shutdown_requested) break;
+            continue;
+        }
+
+        if (leader_shutdown_requested) {
+            shutdown(follower_fd, SHUT_RDWR);
+            close(follower_fd);
+            break;
+        }
 
         FollowerRegisterMsg reg_msg;
         recv(follower_fd, &reg_msg, sizeof(reg_msg), 0);
@@ -197,6 +304,7 @@ void* accept_handler(void* arg) {
         printf("Follower registered (socket=%d %s:%d)\n",
                follower_fd, reg_msg.selfAddress.ip, reg_msg.selfAddress.udp_port);
     }
+    return NULL;
 }
 
 /* Function: Broadcast a raw message to all active followers (thread-safe) */
@@ -214,6 +322,10 @@ void broadcast_to_followers(const void* msg_data, size_t msg_len) {
 
 /* Function: Register a newly connected follower, send assigned ID and topology updates */
 void register_new_follower(int fd, FollowerRegisterMsg* reg_msg) {
+    if (leader_shutdown_requested) {
+        close(fd);
+        return;
+    }
     pthread_mutex_lock(&mutex_followers);
 
     /* Keep active followers packed so new joiners become last. */
@@ -413,7 +525,7 @@ void* follower_message_receiver(void* arg) {
 
     printf("[RECEIVER] Follower message receiver thread started\n");
 
-    while (1) {
+    while (!leader_shutdown_requested) {
         fd_set readfds;
         FD_ZERO(&readfds);
         int maxfd = -1;
@@ -435,7 +547,12 @@ void* follower_message_receiver(void* arg) {
 
         struct timeval tv = {.tv_sec = 0, .tv_usec = 100000}; // 100ms timeout
         int ready = select(maxfd + 1, &readfds, NULL, NULL, &tv);
-        if (ready <= 0) continue;
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            if (leader_shutdown_requested) break;
+            continue;
+        }
+        if (ready == 0) continue;
 
         pthread_mutex_lock(&mutex_followers);
         for (int i = 0; i < MAX_FOLLOWERS; i++) {
@@ -448,6 +565,7 @@ void* follower_message_receiver(void* arg) {
             if (r <= 0) {
                 if (r == 0) printf("\n[RECEIVER] Follower %d disconnected\n", followers[i].id);
                 else perror("recv");
+                shutdown(fd, SHUT_RDWR);
                 close(fd);
 
                 /* Update session state and active count */
@@ -527,11 +645,16 @@ void queue_commands(LeaderCommand* ldr_cmd) {
 void* send_handler(void* arg) {
     (void)arg;
 
-    while (1) {
+    while (!leader_shutdown_requested) {
         pthread_mutex_lock(&cmd_queue.mutex);
 
-        while (cmd_queue.head == cmd_queue.tail) {
+        while (cmd_queue.head == cmd_queue.tail && !leader_shutdown_requested) {
             pthread_cond_wait(&cmd_queue.not_empty, &cmd_queue.mutex);
+        }
+
+        if (leader_shutdown_requested) {
+            pthread_mutex_unlock(&cmd_queue.mutex);
+            break;
         }
 
         LeaderCommand ldr_cmd = cmd_queue.queue[cmd_queue.head];
@@ -548,15 +671,19 @@ void* send_handler(void* arg) {
         memcpy(ldr_cmd_msg.matrix_clock.mc, leader_clock.mc, sizeof(leader_clock.mc));
         broadcast_to_followers(&ldr_cmd_msg, sizeof(ldr_cmd_msg));
     }
+
+    return NULL;
 }
 
 /* Centralized leader state machine: single writer for leader state */
 void* leader_state_machine(void* arg) {
     (void)arg;
     unsigned long tick_count = 0;
-    while (1) {
+    while (!leader_shutdown_requested) {
         Event ev = pop_event(&leader_EventQ);
         switch (ev.type) {
+            case EVT_SHUTDOWN:
+                return NULL;
             case EVT_PLATOON_FORMED: {
                 printf("\n[FORMATION] EVT_PLATOON_FORMED received - scheduling finalization\n");
                 finalize_topology_atomic();
@@ -633,7 +760,7 @@ void* leader_state_machine(void* arg) {
                     /* Also broadcast emergency to followers */
                     broadcast_emergency_to_followers();
                 } else if (c == 'q') {
-                    exit(0); /* terminate cleanly */
+                    leader_request_shutdown("user");
                 }
                 break;
             }
@@ -696,28 +823,31 @@ void *input_handler(void *arg) {
   newt.c_lflag &= ~(ICANON | ECHO);
   tcsetattr(STDIN_FILENO, TCSANOW, &newt);
 
-  while (1) {
-        int ch = getchar();
-        if (ch == EOF) {
-            /* If stdin is closed/non-interactive, avoid busy-looping and flooding the event queue */
-            clearerr(stdin);
-            struct timespec ts = {.tv_sec = 0, .tv_nsec = 10L * 1000L * 1000L};
-            nanosleep(&ts, NULL);
-            continue;
-        }
+    while (!leader_shutdown_requested) {
+                fd_set rfds;
+                FD_ZERO(&rfds);
+                FD_SET(STDIN_FILENO, &rfds);
+                struct timeval tv = {.tv_sec = 0, .tv_usec = 200000};
 
-        char c = (char)ch;
+                int ready = select(STDIN_FILENO + 1, &rfds, NULL, NULL, &tv);
+                if (ready < 0) {
+                        if (errno == EINTR) continue;
+                        break;
+                }
+                if (ready == 0) continue;
+                if (!FD_ISSET(STDIN_FILENO, &rfds)) continue;
+
+                char c = 0;
+                ssize_t n = read(STDIN_FILENO, &c, 1);
+                if (n <= 0) continue;
+
     Event evt = {0};
     evt.type = EVT_USER_INPUT;
     evt.event_data.input.key = c;
     push_event(&leader_EventQ, &evt);
-
-    if (c == 'q') {
-      /* Restore terminal before exiting input thread; state-machine handles actual shutdown */
-      tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
-      return NULL;
-    }
   }
+
+    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
   return NULL;
 }
 

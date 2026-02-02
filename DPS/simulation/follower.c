@@ -13,6 +13,7 @@
 #include <arpa/inet.h>
 #include <math.h>
 #include <errno.h>
+#include <signal.h>
 
 #include "truckplatoon.h"
 #include "event.h"
@@ -43,8 +44,13 @@ pthread_mutex_t mutex_topology;
 pthread_mutex_t mutex_sockets;
 
 // SOCKET RELATED
-int udp_sock;
-int32_t tcp2Leader;
+int udp_sock = -1;
+int32_t tcp2Leader = -1;
+
+static volatile sig_atomic_t follower_shutdown_requested = 0;
+static volatile sig_atomic_t follower_sig_received = 0;
+
+static void follower_on_signal(int signo);
 
 // Control Vars //bw
 int follower_idx = 0;
@@ -73,6 +79,43 @@ static void handle_distance_update(Event *evnt);
 
 MatrixClock follower_clock;  // mc
 
+int follower_is_shutting_down(void) {
+    return follower_shutdown_requested ? 1 : 0;
+}
+
+void follower_request_shutdown(const char* reason) {
+    if (follower_shutdown_requested) return;
+    follower_shutdown_requested = 1;
+    simulation_running = 0;
+
+    if (reason) {
+        fprintf(stderr, "\n[FOLLOWER] Shutdown requested (%s)\n", reason);
+    }
+
+    /* Wake state machine */
+    Event ev = {.type = EVT_SHUTDOWN};
+    push_event(&truck_EventQ, &ev);
+
+    /* Close sockets to unblock recv/recvfrom */
+    pthread_mutex_lock(&mutex_sockets);
+    if (tcp2Leader >= 0) {
+        shutdown(tcp2Leader, SHUT_RDWR);
+        close(tcp2Leader);
+        tcp2Leader = -1;
+    }
+    if (udp_sock >= 0) {
+        shutdown(udp_sock, SHUT_RDWR);
+        close(udp_sock);
+        udp_sock = -1;
+    }
+    pthread_mutex_unlock(&mutex_sockets);
+}
+
+static void follower_on_signal(int signo) {
+    (void)signo;
+    follower_sig_received = 1;
+}
+
 int main(int argc, char* argv[]) {
 
     if (argc != 2) {
@@ -82,6 +125,13 @@ int main(int argc, char* argv[]) {
 
     const char* my_ip = LEADER_IP;
     uint16_t my_port = atoi(argv[1]);
+
+    struct sigaction sa = {0};
+    sa.sa_handler = follower_on_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
     
     mc_init(&follower_clock); //matrix clock initialization
 
@@ -134,7 +184,11 @@ int main(int argc, char* argv[]) {
 
     // DECOUPLED PHYSICS TIMER: Runs independently of event processing
     // This ensures continuous motion even if event queue fills up
-    while (simulation_running) {
+    while (simulation_running && !follower_shutdown_requested) {
+        if (follower_sig_received) {
+            follower_request_shutdown("signal");
+            break;
+        }
         phys_tick_count++;
         next_tick.tv_nsec += (long)(FOLLOWER_PHYS_DT * 1e9);
         if (next_tick.tv_nsec >= 1e9) {
@@ -167,8 +221,13 @@ int main(int argc, char* argv[]) {
         
         clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_tick, NULL);
     }
-    close(tcp2Leader);
-    close(udp_sock);
+
+    follower_request_shutdown("main exit");
+
+    pthread_join(intruder_tid, NULL);
+    pthread_join(udp_tid, NULL);
+    pthread_join(tcp_tid, NULL);
+    pthread_join(sm_tid, NULL);
     return 0;
 }
 
@@ -179,10 +238,20 @@ void* udp_listener(void* arg) {
     (void)arg;
     FT_MESSAGE msg;
     
-    while (1) {
-        ssize_t recv_len = recvfrom(udp_sock, &msg, sizeof(msg), 0, NULL, NULL);
+    while (!follower_shutdown_requested) {
+        int local_udp;
+        pthread_mutex_lock(&mutex_sockets);
+        local_udp = udp_sock;
+        pthread_mutex_unlock(&mutex_sockets);
+
+        if (local_udp < 0) break;
+
+        ssize_t recv_len = recvfrom(local_udp, &msg, sizeof(msg), 0, NULL, NULL);
         if (recv_len < 0) {
+            if (errno == EINTR) continue;
+            if (follower_shutdown_requested) break;
             perror("recvfrom");
+            follower_request_shutdown("udp recvfrom error");
             break;
         }
 
@@ -214,9 +283,21 @@ void* udp_listener(void* arg) {
 void* tcp_listener(void* arg) {
 
     LD_MESSAGE msg;
-    while (1) {
-            if (recv(tcp2Leader, &msg, sizeof(msg), 0) <= 0)
+    while (!follower_shutdown_requested) {
+            int local_tcp;
+            pthread_mutex_lock(&mutex_sockets);
+            local_tcp = tcp2Leader;
+            pthread_mutex_unlock(&mutex_sockets);
+
+            if (local_tcp < 0) break;
+
+            ssize_t rr = recv(local_tcp, &msg, sizeof(msg), 0);
+            if (rr <= 0) {
+                if (!follower_shutdown_requested) {
+                    follower_request_shutdown("tcp recv closed");
+                }
                 break;
+            }
 
             switch (msg.type){
                 case MSG_LDR_CMD:
@@ -286,8 +367,13 @@ void* tcp_listener(void* arg) {
     
 //FUNC: TRUCK State Machine Thread function
 void* truck_state_machine(void* arg) {
-    while (1) {
+    (void)arg;
+    while (!follower_shutdown_requested) {
         Event evnt = pop_event(&truck_EventQ);
+
+        if (evnt.type == EVT_SHUTDOWN) {
+            break;
+        }
 
         switch (follower.state) {
         case CRUISE:
@@ -411,7 +497,7 @@ void* truck_state_machine(void* arg) {
             
         }
     }
-    pthread_exit(pthread_self); // Check if correct
+    return NULL;
 }
 
 

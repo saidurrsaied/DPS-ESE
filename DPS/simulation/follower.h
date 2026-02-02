@@ -70,4 +70,8 @@ void update_intruder(IntruderInfo intruder);
 void restore_nominal_distance(void);
 void adjust_distance_from_front(FT_POSITION front_pos);
 
+/* Graceful shutdown (implemented in follower.c) */
+void follower_request_shutdown(const char* reason);
+int follower_is_shutting_down(void);
+
 #endif
