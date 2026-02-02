@@ -50,13 +50,13 @@ void mc_receive_event(MatrixClock *local, MatrixClock *received, int truck_id)
 // Print matrix clock
 void mc_print(MatrixClock *clock)
 {
-    printf("Matrix Clock:\n");
+    printf("\n\rMatrix Clock:\n");
     for (int i = 0; i < NUM_TRUCKS; i++) {
         for (int j = 0; j < NUM_TRUCKS; j++) {
             printf("%3d ", clock->mc[i][j]);
         }
         printf("\n");
     }
-    printf("\n");
+   
 }
 

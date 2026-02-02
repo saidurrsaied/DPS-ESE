@@ -29,7 +29,14 @@ extern EventQueue truck_EventQ;
 extern int udp_sock;
 extern int32_t tcp2Leader;
 
+#include "matrix_clock.h"
+extern int follower_idx;
+extern int platoon_position;  /* Logical position in current platoon (1 = first after leader) */
+extern MatrixClock follower_clock;
 
+/* Intruder Context (for dynamic gap control) */
+extern IntruderInfo current_intruder;
+extern float current_target_gap;
 
 /* Thread Functions */
 void* udp_listener(void* arg);

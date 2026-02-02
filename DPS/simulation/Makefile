@@ -11,7 +11,7 @@ FOLLOWER_OBJS = $(FOLLOWER_SRCS:.c=.o)
 FOLLOWER_EXEC = follower
 
 # Source files for leader
-LEADER_SRCS = leader.c matrix_clock.c
+LEADER_SRCS = leader.c matrix_clock.c event.c
 LEADER_OBJS = $(LEADER_SRCS:.c=.o)
 LEADER_EXEC = leader
 
@@ -47,6 +47,18 @@ run-leader: $(LEADER_EXEC)
 # Run single follower instance (pass port as argument)
 run-follower: $(FOLLOWER_EXEC)
 	./$(FOLLOWER_EXEC) 5001
+
+# Test: build leader integration test
+tests/test_leader: tests/test_leader_integration.o tests/leader_test.o event.o matrix_clock.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+# Build a test-friendly leader object that excludes the real main
+tests/leader_test.o: leader.c
+	$(CC) $(CFLAGS) -DTEST_LEADER -c $< -o $@
+
+.PHONY: test
+test: tests/test_leader
+	./tests/test_leader
 
 # Help
 help:

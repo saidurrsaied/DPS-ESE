@@ -30,4 +30,13 @@ int32_t connect2Leader(void);
  */
 int32_t createUDPServer(uint16_t udp_port);
 
+
+/* Follower session encapsulation */
+typedef struct {
+    int id;           /* logical ID starting at 1 */
+    int fd;           /* socket FD */
+    NetInfo address;  /* IP and UDP port */
+    int active;       /* 1 = connected, 0 = empty/disconnected */
+} FollowerSession;
+
 #endif
