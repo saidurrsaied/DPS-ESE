@@ -36,6 +36,7 @@ pthread_t tid;
 pthread_t udp_tid, tcp_tid, sm_tid;
 pthread_t intruder_tid; //meghana
 pthread_t watchdog_tid;
+pthread_t gpu_intruder_tid; //Rajdeep
 EventQueue truck_EventQ;
 TurnQueue follower_turns; // bw
 
@@ -48,9 +49,22 @@ pthread_mutex_t mutex_leader_rx;
 static uint64_t monotonic_ms(void);
 static void follower_update_leader_rx_time(void);
 static void* leader_rx_watchdog(void* arg);
+static void* gpu_intruder_listener(void* arg); //Rajdeep
+
+typedef struct {
+    unsigned long long seq;
+    int target_id;
+    int active;
+    int speed;
+    int length;
+    unsigned int duration_ms;
+} GpuIntruderSample; //Rajdeep
+
+static int read_gpu_intruder(const char* path, GpuIntruderSample* out); //Rajdeep
 
 static uint64_t last_leader_rx_ms = 0;
 static int leader_timeout_emitted = 0;
+static const char* gpu_intruder_path = NULL; //Rajdeep
 
 // SOCKET RELATED
 int udp_sock = -1;
@@ -134,6 +148,8 @@ int main(int argc, char* argv[]) {
 
     const char* my_ip = LEADER_IP;
     uint16_t my_port = atoi(argv[1]);
+    const char* env_intruder_path = getenv("GPU_INTRUDER_FILE"); //Rajdeep
+    gpu_intruder_path = (env_intruder_path && env_intruder_path[0]) ? env_intruder_path : GPU_INTRUDER_FILE; //Rajdeep
 
     struct sigaction sa = {0};
     sa.sa_handler = follower_on_signal;
@@ -181,6 +197,7 @@ int main(int argc, char* argv[]) {
     pthread_create(&sm_tid, NULL, truck_state_machine, NULL);
     pthread_create(&intruder_tid, NULL, keyboard_listener, NULL);//meghana
     pthread_create(&watchdog_tid, NULL, leader_rx_watchdog, NULL);
+    pthread_create(&gpu_intruder_tid, NULL, gpu_intruder_listener, NULL); //Rajdeep
     printf("[INIT] Threads started: udp_listener, tcp_listener, state_machine, keyboard_listener\n");
    
 
@@ -266,6 +283,7 @@ int main(int argc, char* argv[]) {
     follower_request_shutdown("main exit");
 
     pthread_join(intruder_tid, NULL);
+    pthread_join(gpu_intruder_tid, NULL); //Rajdeep
     pthread_join(udp_tid, NULL);
     pthread_join(tcp_tid, NULL);
     pthread_join(sm_tid, NULL);
@@ -322,6 +340,79 @@ static void* leader_rx_watchdog(void* arg) {
         }
     }
 
+    return NULL;
+}
+
+static int read_gpu_intruder(const char* path, GpuIntruderSample* out) { //Rajdeep
+    if (!path || !out) return -1;
+    FILE* f = fopen(path, "r");
+    if (!f) return -1;
+    unsigned long long seq = 0;
+    int target_id = 0;
+    int active = 0;
+    int speed = 0;
+    int length = 0;
+    unsigned int duration_ms = 0;
+    double ts = 0.0;
+    int n = fscanf(f, "%llu %d %d %d %d %u %lf", &seq, &target_id, &active, &speed, &length, &duration_ms, &ts);
+    fclose(f);
+    if (n < 6) return -1; //Rajdeep
+    out->seq = seq;
+    out->target_id = target_id;
+    out->active = active ? 1 : 0;
+    out->speed = speed;
+    out->length = length;
+    out->duration_ms = duration_ms;
+    return 0;
+}
+
+static void* gpu_intruder_listener(void* arg) { //Rajdeep
+    (void)arg;
+    GpuIntruderSample last = {0};
+    int has_last = 0;
+
+    while (!follower_shutdown_requested) {
+        GpuIntruderSample cur;
+        if (read_gpu_intruder(gpu_intruder_path, &cur) == 0) {
+            if (!has_last || cur.seq != last.seq) {
+                if (cur.target_id != 0 && follower_idx != 0 && cur.target_id != follower_idx) { //Rajdeep
+                    last = cur;
+                    has_last = 1;
+                    goto gpu_intruder_sleep;
+                }
+                int need_event = 0;
+                if (!has_last) {
+                    need_event = cur.active ? 1 : 0;
+                } else if (cur.active != last.active) {
+                    need_event = 1;
+                } else if (cur.active &&
+                           (cur.speed != last.speed || cur.length != last.length ||
+                            cur.duration_ms != last.duration_ms)) {
+                    need_event = 1;
+                }
+
+                if (need_event) {
+                    Event ev;
+                    if (cur.active) {
+                        ev.type = EVT_INTRUDER;
+                        ev.event_data.intruder.speed = cur.speed;
+                        ev.event_data.intruder.length = cur.length;
+                        ev.event_data.intruder.duration_ms = cur.duration_ms;
+                    } else {
+                        ev.type = EVT_INTRUDER_CLEAR;
+                    }
+                    push_event(&truck_EventQ, &ev);
+                }
+
+                last = cur;
+                has_last = 1;
+            }
+        }
+
+gpu_intruder_sleep:
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = (long)GPU_INTRUDER_POLL_MS * 1000L * 1000L};
+        nanosleep(&ts, NULL);
+    }
     return NULL;
 }
 
