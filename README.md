@@ -27,3 +27,7 @@ Copy the link that is generated, it is important.
 - 7 - In google collab document place in the place of 'LIVE URL'
 example: LIVE_URL = "https://<your-tunnel>.trycloudflare.com/latest.json"
 - 8 - Check followers and leader terminals to visualise intruder functionalities.
+
+
+
+- Google COlab link - https://colab.research.google.com/drive/1JVvTCj-GT2aPRWp31uPJZzAOVth2FNtJ?usp=sharing
